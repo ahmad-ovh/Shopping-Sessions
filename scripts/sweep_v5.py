@@ -38,6 +38,9 @@ def run_one(image, env_dict, data_path="/vol/p5", mem="6g"):
     m = re.findall(r"total\s+([\d.]+)\s+ms", p.stderr)
     if m:
         internal = float(m[-1]) / 1000.0
+    m_se = re.search(r"total=([\d.]+)ms", p.stderr)
+    if internal is None and m_se:
+        internal = float(m_se.group(1)) / 1000.0
     m2 = re.search(r"TOTAL:\s+([\d.]+)s", p.stdout + "\n" + p.stderr)
     if internal is None and m2:
         internal = float(m2.group(1))
@@ -54,15 +57,15 @@ def main():
         ]
         rounds = 2
     else:
-        img_new = sys.argv[2] if len(sys.argv) > 2 else "hyperion:v7"
-        img_base = sys.argv[3] if len(sys.argv) > 3 else "hyperion:v6.3-gcc14"
+        img_new = sys.argv[2] if len(sys.argv) > 2 else "hyperion:latest"
+        img_base = sys.argv[3] if len(sys.argv) > 3 else "comp-aryan"
         data_path = sys.argv[4] if len(sys.argv) > 4 else "/vol/p5"
         configs = [
-            (img_base,      img_base,      {"HYPERION_PROFILE": "1"}),
-            (img_new,       img_new,       {"HYPERION_PROFILE": "1"}),
+            (img_base,      img_base,      {"HYPERION_PROFILE": "1", "SE_TIMING": "1", "SS_VERBOSE": "1"}),
+            (img_new,       img_new,       {"HYPERION_PROFILE": "1", "SE_TIMING": "1", "SS_VERBOSE": "1"}),
             ("comp-mego74", "comp-mego74", {}),
         ]
-        rounds = 5
+        rounds = int(sys.argv[5]) if len(sys.argv) > 5 else 3
 
     # Warmup
     run_one(configs[0][1], configs[0][2], data_path=data_path)
@@ -87,7 +90,7 @@ def main():
         print(f"  {name:16s}: wall med={statistics.median(ws):.4f}s (min {min(ws):.4f}s) | internal med={im}")
     print("\n=== LAST PROFILES ===")
     for name, _, _ in configs:
-        if res[name]["last"] and "[prof]" in res[name]["last"]:
+        if res[name]["last"]:
             print(f"--- {name} ---")
             print(res[name]["last"])
 

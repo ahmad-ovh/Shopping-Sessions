@@ -615,6 +615,11 @@ struct LinkResolver {
             hex_mask = htab_cap - 1u;
             hex_tab = static_cast<HexAliasSlot*>(huge_alloc(size_t(htab_cap) * sizeof(HexAliasSlot)));
         }
+        if (!thp_safe()) {
+            if (bloom)     back_huge_window(bloom, size_t(bwords) * sizeof(u64));
+            if (short_tab) back_huge_window(short_tab, size_t(stab_cap) * sizeof(ShortAliasSlot));
+            if (hex_tab)   back_huge_window(hex_tab, size_t(htab_cap) * sizeof(HexAliasSlot));
+        }
 
         std::atomic<u32> ovf_ctr{0};
         auto* abloom = reinterpret_cast<std::atomic<u64>*>(bloom);

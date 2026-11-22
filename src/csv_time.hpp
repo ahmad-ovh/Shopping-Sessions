@@ -261,29 +261,28 @@ struct FastTime {
     }
 
     inline i64 parse(const u8* s, size_t n) const {
-        if (__builtin_expect(n == 20, 1)) {
+        if (__builtin_expect(n >= 20 && s[10] == 'T', 1)) {
             i64 secs;
-            if (__builtin_expect(s[19] == 'Z' && parse_dt19_sec(s, secs), 1)) {
-                return secs * 1000LL;
+            if (__builtin_expect(!parse_dt19_sec(s, secs), 0)) return INVALID_TS;
+            if (__builtin_expect(n == 20, 1)) {
+                return (s[19] == 'Z') ? (secs * 1000LL) : INVALID_TS;
+            }
+            if (__builtin_expect(n == 25, 1)) {
+                u8 sgn = s[19];
+                if (__builtin_expect((sgn != '+' && sgn != '-') || s[22] != ':', 0)) return INVALID_TS;
+                u32 a = u32(s[20] - '0'), b = u32(s[21] - '0');
+                u32 c = u32(s[23] - '0'), d = u32(s[24] - '0');
+                if (__builtin_expect((a > 9u) | (b > 9u) | (c > 9u) | (d > 9u), 0)) return INVALID_TS;
+                u32 oh = a * 10u + b, om = c * 10u + d;
+                if (__builtin_expect(oh > 23u || om > 59u, 0)) return INVALID_TS;
+                i64 off = i64(oh * 3600u + om * 60u);
+                if (sgn == '-') off = -off;
+                return (secs - off) * 1000LL;
             }
             return INVALID_TS;
         }
         if (__builtin_expect(n == 13, 1)) {
             return parse_f3_13(s);
-        }
-        if (__builtin_expect(n == 25, 1)) {
-            u8 sgn = s[19];
-            if (__builtin_expect((sgn != '+' && sgn != '-') || s[22] != ':', 0)) return INVALID_TS;
-            u32 a = u32(s[20] - '0'), b = u32(s[21] - '0');
-            u32 c = u32(s[23] - '0'), d = u32(s[24] - '0');
-            if (__builtin_expect((a > 9u) | (b > 9u) | (c > 9u) | (d > 9u), 0)) return INVALID_TS;
-            u32 oh = a * 10u + b, om = c * 10u + d;
-            if (__builtin_expect(oh > 23u || om > 59u, 0)) return INVALID_TS;
-            i64 secs;
-            if (__builtin_expect(!parse_dt19_sec(s, secs), 0)) return INVALID_TS;
-            i64 off = i64(oh * 3600u + om * 60u);
-            if (sgn == '-') off = -off;
-            return (secs - off) * 1000LL;
         }
         return parse_f3_general(s, n);
     }
@@ -469,6 +468,179 @@ static inline void scan_csv(const u8* base, size_t start, size_t end, Callback&&
                     cb(fl);
                 }
             }
+        }
+    }
+
+    if (fast_end < end) {
+        if (split_exact<NF>(base + fast_end, base + end, fl)) {
+            cb(fl);
+        }
+    }
+}
+
+// 2-Stage L1-Resident Block CSV Scanner (zero per-field quote loads, zero qbefore popcounts!)
+// Stage 1: Scans 4 KiB (64 x 64B aligned blocks) ONCE via SIMD, validates quotes across block
+//          boundaries with 6-op carry arithmetic, and emits dense (pos, flags) in L1D.
+// Stage 2: Validates all NF fields + quotes in ONE 64-bit mask check per line.
+template <int NF, class Callback>
+static inline void scan_csv_block(const u8* base, size_t start, size_t end, Callback&& cb) {
+    if (start >= end) return;
+    size_t fast_end = end;
+    while (fast_end > start && base[fast_end - 1] != '\n') --fast_end;
+
+    Field fl[NF];
+    if (fast_end > start) {
+        constexpr size_t CHUNK_BYTES = 4096;
+        u16 pos_buf[CHUNK_BYTES + 64];
+        u8  flg_buf[CHUNK_BYTES + 64];
+
+        size_t pos = start;
+        size_t blk = pos & ~size_t(63);
+        u64 first_mask = (~0ULL) << (pos & 63u);
+
+        u8 open_q_carry = 0;
+        u64 init_fs_bit = 1ULL << (pos & 63u);
+        u8 prev_d = 0;
+        u8 prev_cl63 = 0;
+        u8 trailing_bad = 0;
+
+        constexpr u64 FLG_MASK = (NF == 7) ? 0x0006060606060606ULL : 0x0000000006060606ULL;
+        constexpr u64 FLG_WANT = (NF == 7) ? 0x0002000000000000ULL : 0x0000000002000000ULL;
+
+        i32 carry_start = i32(start - blk); // offset relative to current chunk_base of line's first byte
+
+        while (blk < fast_end) {
+            const size_t chunk_base = blk;
+            const size_t blk_limit = std::min(fast_end, blk + CHUNK_BYTES);
+            u32 nd = 0;
+
+            for (; blk < blk_limit; blk += 64) {
+                __builtin_prefetch(base + blk + 512, 0, 0);
+                u64 d, nlm, qm;
+                block_masks64(base + blk, d, nlm, qm);
+                if (first_mask != ~0ULL) {
+                    d   &= first_mask;
+                    nlm &= first_mask;
+                    qm  &= first_mask;
+                    first_mask = ~0ULL;
+                }
+                if (blk + 64 > fast_end) {
+                    u32 rem = u32(fast_end - blk);
+                    u64 em = (1ULL << rem) - 1ULL;
+                    d   &= em;
+                    nlm &= em;
+                    qm  &= em;
+                }
+
+                u64 fs_mask = (d << 1) | u64(prev_d) | init_fs_bit;
+                init_fs_bit = 0;
+                u64 qs = qm & fs_mask;
+                u64 next_d0 = (blk + 64 < fast_end) ? u64(base[blk + 64] == ',' || base[blk + 64] == '\n') : 1ULL;
+                u64 cl = qm & ((d >> 1) | (next_d0 << 63));
+                unsigned long long sum_ll = 0;
+                u8 next_open_q = _addcarry_u64(open_q_carry, ~d, qs, &sum_ll);
+                u64 sum = u64(sum_ll);
+                u64 od_at_d = sum & d;
+                u64 cl_at_d = (cl << 1) | u64(prev_cl63);
+                u64 bad_q = (qm ^ (qs | cl)) | (qs & cl) | (od_at_d ^ cl_at_d);
+
+                prev_d = u8((blk + 64 <= fast_end) ? ((d >> 63) & 1ULL) : 1ULL);
+                prev_cl63 = u8(cl >> 63);
+                open_q_carry = next_open_q;
+
+                const u32 blk_off = u32(blk - chunk_base);
+                if (__builtin_expect(bad_q == 0 && trailing_bad == 0, 1)) {
+                    while (d) {
+                        u32 b = u32(__builtin_ctzll(d));
+                        pos_buf[nd] = u16(blk_off + b);
+                        flg_buf[nd] = u8(((od_at_d >> b) & 1ULL) | (((nlm >> b) & 1ULL) << 1));
+                        nd++;
+                        d &= d - 1ULL;
+                    }
+                } else {
+                    u64 bm = bad_q;
+                    while (d) {
+                        u32 b = u32(__builtin_ctzll(d));
+                        u64 upto = (b == 63u) ? ~0ULL : ((1ULL << (b + 1u)) - 1ULL);
+                        u8 bad_bit = trailing_bad;
+                        if (bm & upto) { bad_bit = 4u; bm &= ~upto; }
+                        trailing_bad = 0;
+                        pos_buf[nd] = u16(blk_off + b);
+                        flg_buf[nd] = u8(((od_at_d >> b) & 1ULL) | (((nlm >> b) & 1ULL) << 1) | bad_bit);
+                        nd++;
+                        d &= d - 1ULL;
+                    }
+                    if (bm != 0) trailing_bad = 4u;
+                }
+            }
+
+            // Sentinel padding so 8-byte load at end of flg_buf is always safe & fails FLG_WANT
+            std::memset(flg_buf + nd, 0x04, 8);
+            const u8* cptr = base + chunk_base;
+            u32 k = 0;
+            i32 line_start = carry_start;
+
+            // Find first complete line if we carried a partial line from previous chunk
+            if (line_start < 0) {
+                // Previous chunk ended mid-line; check if its fields + remaining fields in this chunk form a valid line
+                u32 nl_k = 0;
+                while (nl_k < nd && (flg_buf[nl_k] & 2u) == 0) ++nl_k;
+                if (nl_k < nd) {
+                    const u8* ls_ptr = cptr + line_start;
+                    const u8* le_ptr = cptr + pos_buf[nl_k];
+                    if (split_exact<NF>(ls_ptr, le_ptr, fl)) cb(fl);
+                    line_start = i32(pos_buf[nl_k]) + 1;
+                    k = nl_k + 1;
+                } else {
+                    // Whole 4 KiB chunk had no newline (line > 4 KiB!)
+                    carry_start = line_start - i32(blk - chunk_base);
+                    continue;
+                }
+            }
+
+            // Stage 2: Fast straight-line loop over complete lines in this 4 KiB chunk!
+            while (k + u32(NF) <= nd) {
+                u64 w;
+                std::memcpy(&w, flg_buf + k, 8);
+                if (__builtin_expect((w & FLG_MASK) == FLG_WANT, 1)) {
+                    i32 s = line_start;
+                    #pragma GCC unroll 7
+                    for (int j = 0; j < NF; ++j) {
+                        u32 q = u32((w >> (8 * j)) & 1u);
+                        u32 e = pos_buf[k + j];
+                        fl[j].p = cptr + s + q;
+                        fl[j].n = u32(i32(e) - s) - 2u * q;
+                        s = i32(e) + 1;
+                    }
+                    cb(fl);
+                    line_start = s;
+                    k += u32(NF);
+                } else {
+                    while (k < nd && (flg_buf[k] & 2u) == 0) ++k;
+                    if (k < nd) {
+                        line_start = i32(pos_buf[k]) + 1;
+                        ++k;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Handle any remaining complete lines near the end of nd (< NF delimiters left)
+            while (k < nd) {
+                u32 nl_k = k;
+                while (nl_k < nd && (flg_buf[nl_k] & 2u) == 0) ++nl_k;
+                if (nl_k >= nd) break;
+                if (nl_k - k + 1u == u32(NF)) {
+                    const u8* ls_ptr = cptr + line_start;
+                    const u8* le_ptr = cptr + pos_buf[nl_k];
+                    if (split_exact<NF>(ls_ptr, le_ptr, fl)) cb(fl);
+                }
+                line_start = i32(pos_buf[nl_k]) + 1;
+                k = nl_k + 1;
+            }
+
+            carry_start = line_start - i32(blk - chunk_base);
         }
     }
 

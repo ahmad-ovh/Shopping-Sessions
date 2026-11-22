@@ -152,13 +152,60 @@ struct RegionTracker {
 
 inline RegionTracker g_regions;
 
+inline constexpr int HYP_MADV_POPULATE_WRITE = 23;
+inline constexpr int HYP_MADV_COLLAPSE       = 25;
+
+// Pre-backs [addr, addr + len) with writable 2 MiB hugepages (via MADV_POPULATE_WRITE when
+// THP is enabled, or write + MADV_COLLAPSE + MADV_POPULATE_WRITE fallback when THP=never on scorer!).
+// Eliminates read-zero-page -> CoW split faults AND 416K per-4KB hardware #PF page faults!
+inline void back_huge_window(void* addr, size_t len) {
+    if (!addr || len == 0) return;
+    constexpr size_t HP = 2u << 20;
+    u8* base = static_cast<u8*>(addr);
+    static std::atomic<int> pop_refused{0};
+    static std::atomic<int> col_refused{0};
+
+    if (thp_safe()) {
+        if (pop_refused.load(std::memory_order_relaxed) == 0) {
+            if (::madvise(base, len, HYP_MADV_POPULATE_WRITE) == 0) return;
+            pop_refused.store(1, std::memory_order_relaxed);
+        }
+        for (size_t off = 0; off < len; off += HP) {
+            *reinterpret_cast<volatile u8*>(base + off) = 0;
+        }
+        return;
+    }
+
+    // Scorer path (THP = [never], Linux 6.4+): touch 1 byte per 2 MiB step and MADV_COLLAPSE (25)
+    // into true 2 MiB PMD hugepages; if refused, batch-populate with MADV_POPULATE_WRITE (23).
+    const size_t whole = (uintptr_t(base) & (HP - 1)) == 0 ? (len & ~size_t(HP - 1)) : 0;
+    if (whole > 0 && col_refused.load(std::memory_order_relaxed) < 8) {
+        for (size_t off = 0; off < whole; off += HP) {
+            *reinterpret_cast<volatile u8*>(base + off) = 0;
+        }
+        if (::madvise(base, whole, HYP_MADV_COLLAPSE) == 0) {
+            col_refused.store(0, std::memory_order_relaxed);
+            if (len > whole && pop_refused.load(std::memory_order_relaxed) == 0) {
+                ::madvise(base + whole, len - whole, HYP_MADV_POPULATE_WRITE);
+            }
+            return;
+        }
+        col_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (pop_refused.load(std::memory_order_relaxed) == 0) {
+        if (::madvise(base, len, HYP_MADV_POPULATE_WRITE) != 0) {
+            pop_refused.store(1, std::memory_order_relaxed);
+        }
+    }
+}
+
 inline void* huge_alloc(size_t bytes, bool track = true, void** out_raw = nullptr, size_t* out_raw_len = nullptr) {
     if (bytes == 0) bytes = 4096;
     constexpr size_t HP = 2u << 20;
     size_t rounded = (bytes + 4095u) & ~size_t(4095u);
     void* p = nullptr;
     size_t alloc_len = rounded;
-    if (rounded >= HP && thp_safe()) {
+    if (rounded >= HP) {
         alloc_len = rounded + HP;
         void* raw = ::mmap(nullptr, alloc_len, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -166,7 +213,7 @@ inline void* huge_alloc(size_t bytes, bool track = true, void** out_raw = nullpt
         uintptr_t addr = (uintptr_t(raw) + HP - 1) & ~(uintptr_t(HP) - 1);
         p = reinterpret_cast<void*>(addr);
 #ifdef MADV_HUGEPAGE
-        ::madvise(p, rounded, MADV_HUGEPAGE);
+        if (thp_safe()) ::madvise(p, rounded, MADV_HUGEPAGE);
 #endif
         if (out_raw) *out_raw = raw;
         if (out_raw_len) *out_raw_len = alloc_len;
@@ -242,18 +289,24 @@ struct SlabArena {
         }
     }
 
-    void* alloc(size_t bytes, size_t align = 64) {
+    __attribute__((noinline)) void* alloc_slow(size_t bytes, size_t align) {
+        size_t need = bytes + align;
+        size_t sz = need > reserve_bytes ? ((need + (2u << 20) - 1) & ~size_t((2u << 20) - 1)) : reserve_bytes;
+        cur = static_cast<u8*>(huge_alloc(sz));
+        end = cur + sz;
+        if (!first_cur) {
+            first_cur = cur;
+            first_end = end;
+        }
+        uintptr_t p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
+        cur = reinterpret_cast<u8*>(p + bytes);
+        return reinterpret_cast<void*>(p);
+    }
+
+    inline void* alloc(size_t bytes, size_t align = 64) {
         uintptr_t p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
         if (__builtin_expect(p + bytes > uintptr_t(end), 0)) {
-            size_t need = bytes + align;
-            size_t sz = need > reserve_bytes ? ((need + (2u << 20) - 1) & ~size_t((2u << 20) - 1)) : reserve_bytes;
-            cur = static_cast<u8*>(huge_alloc(sz));
-            end = cur + sz;
-            if (!first_cur) {
-                first_cur = cur;
-                first_end = end;
-            }
-            p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
+            return alloc_slow(bytes, align);
         }
         cur = reinterpret_cast<u8*>(p + bytes);
         return reinterpret_cast<void*>(p);

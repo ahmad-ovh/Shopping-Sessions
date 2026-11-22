@@ -31,11 +31,11 @@ static_assert(sizeof(ShortPGroup5) == 64);
 static constexpr u32 SHORT_PBLK_GROUPS = 63; // 63 * 64 + 64 = 4096 B exact!
 static constexpr u32 SHORT_PBLK_CAP    = SHORT_PBLK_GROUPS * 5; // 315 events/block
 struct alignas(64) ShortPBlock {
-    ShortPBlock* next;
+    ShortPGroup5 g[SHORT_PBLK_GROUPS]; // 0..4031: 100% pure NT-streamed!
+    ShortPBlock* next;                 // 4032..4095: written only when block finishes!
     u32 ngroups;
     u32 idx;
     u32 pad[12];
-    ShortPGroup5 g[SHORT_PBLK_GROUPS];
 };
 static_assert(sizeof(ShortPBlock) == 4096);
 
@@ -104,10 +104,10 @@ static_assert(sizeof(ShortClickGroup3) == 64);
 
 static constexpr u32 SHORT_CKBLK_GROUPS = 63; // 63 * 64 + 64 = 4096 B exact!
 struct alignas(64) ShortClickBlock {
+    ShortClickGroup3 g[SHORT_CKBLK_GROUPS];
     ShortClickBlock* next;
     u32 ngroups;
     u32 pad[13];
-    ShortClickGroup3 g[SHORT_CKBLK_GROUPS];
 };
 static_assert(sizeof(ShortClickBlock) == 4096);
 
@@ -147,10 +147,10 @@ struct alignas(64) ShortEGroup4 {
 };
 static constexpr u32 SHORT_EBLK_GROUPS = 63; // 63 * 64 + 64 = 4096 B exact!
 struct alignas(64) ShortEBlock {
+    ShortERec r[SHORT_EBLK_GROUPS * 4]; // 252 records (0..4031: 100% pure NT-streamed!)
     ShortEBlock* next;
     u32 n;
     u32 pad[13];
-    ShortERec r[SHORT_EBLK_GROUPS * 4]; // 252 records
 };
 static_assert(sizeof(ShortEBlock) == 4096);
 
@@ -308,7 +308,8 @@ struct alignas(64) Worker {
     }
 
     inline void copy64(void* dst, const void* src) const {
-        copy64_wb(dst, src);
+        if (use_nt) copy64_nt(dst, src);
+        else        copy64_wb(dst, src);
     }
 
     __attribute__((noinline)) void alloc_short_p_block(u32 p) {
@@ -2023,6 +2024,9 @@ struct Pipeline {
         if (ncpu > 16) ncpu = 16;
 
         use_nt_stores = false;
+        if (const char* ent = std::getenv("HYPERION_NT")) {
+            use_nt_stores = (ent[0] != '0');
+        }
 
         ::mkdir(out_dir.c_str(), 0777);
         ::mkdir((out_dir + "/user_daily").c_str(), 0777);

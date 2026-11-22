@@ -64,24 +64,15 @@ inline u64 hash_user_key(const UserKey& k) {
 static inline bool parse_hex32_avx2(const u8* p, Hex128& out) {
     __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
 
-    // Check '0'..'9': (v - '0') <= 9 using unsigned saturating-style signed compare
-    // Signed range check: x in [lo, hi] <=> (x ^ 0x80) in [lo^0x80, hi^0x80]
-    // Even simpler: all valid bytes have bit 7 == 0; check directly:
-    __m256i is_dig = _mm256_and_si256(
-        _mm256_cmpgt_epi8(v, _mm256_set1_epi8('0' - 1)),
-        _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), v));
-    __m256i is_af = _mm256_and_si256(
-        _mm256_cmpgt_epi8(v, _mm256_set1_epi8('a' - 1)),
-        _mm256_cmpgt_epi8(_mm256_set1_epi8('f' + 1), v));
-    __m256i ok = _mm256_or_si256(is_dig, is_af);
-    if (__builtin_expect(_mm256_movemask_epi8(ok) != -1, 0)) {
+    __m256i d = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+    __m256i l = _mm256_sub_epi8(v, _mm256_set1_epi8('a'));
+    __m256i is_dig = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    __m256i is_af  = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+    if (__builtin_expect(_mm256_movemask_epi8(_mm256_or_si256(is_dig, is_af)) != -1, 0)) {
         return false;
     }
 
-    // Map '0'..'9' -> 0..9 (sub 48), 'a'..'f' -> 10..15 (sub 87 = 48 + 39)
-    __m256i sub = _mm256_add_epi8(_mm256_set1_epi8('0'),
-                                  _mm256_and_si256(is_af, _mm256_set1_epi8('a' - '0' - 10)));
-    __m256i nib = _mm256_sub_epi8(v, sub); // 32 nibbles in 0..15
+    __m256i nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, is_dig);
 
     // Pair adjacent nibbles: (nib[2i] << 4) | nib[2i+1] via maddubs with [16, 1, 16, 1, ...]
     __m256i weights = _mm256_set1_epi16(0x0110); // byte 0 * 16 + byte 1 * 1
@@ -144,7 +135,7 @@ static inline bool try_pack_short(const u8* p, size_t n, u64& out_word) {
     // and caller buffers are padded. Mask off bytes beyond tlen.
     u64 word;
     std::memcpy(&word, p + 1, 8);
-    const u64 mask = ~u64(0) >> ((8u - tlen) * 8u);
+    const u64 mask = _bzhi_u64(~0ULL, u32(tlen * 8u));
     word &= mask;
     // Reject NUL (0) inside tlen bytes or any non-ASCII byte (>= 0x80)
     const u64 zero_bytes = (word - 0x0101010101010101ULL) & ~word & mask;
