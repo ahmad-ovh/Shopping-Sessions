@@ -6,7 +6,7 @@ import time
 import statistics
 import subprocess
 
-def run_one(image, env_dict, data_path="/vol/p20"):
+def run_one(image, env_dict, data_path="/vol/p5", mem="6g"):
     cmd = [
         "docker", "run", "--rm", "--platform", "linux/amd64",
         "--network", "none", "--read-only",
@@ -14,7 +14,7 @@ def run_one(image, env_dict, data_path="/vol/p20"):
         "--tmpfs", "/scratch:rw,size=512m,mode=1777",
         "--mount", "type=tmpfs,destination=/output",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--pids-limit", "4096", "--cpus", "8", "--memory", "14g", "--memory-swap", "14g",
+        "--pids-limit", "4096", "--cpus", "8", "--memory", mem, "--memory-swap", mem,
         "--user", "1000:1000",
         "-v", "ss-data:/vol:ro",
         "-e", f"DATA_DIR={data_path}", "-e", "OUTPUT_DIR=/output",
@@ -24,10 +24,15 @@ def run_one(image, env_dict, data_path="/vol/p20"):
     for k, v in env_dict.items():
         cmd += ["-e", f"{k}={v}"]
     cmd.append(image)
-    t0 = time.perf_counter()
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    dt = time.perf_counter() - t0
-    if p.returncode != 0:
+    for attempt in range(4):
+        t0 = time.perf_counter()
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        dt = time.perf_counter() - t0
+        if p.returncode == 0:
+            break
+        if attempt < 3 and (p.returncode in (1, 2, 125) and "hyperion fatal" not in p.stderr):
+            time.sleep(2.0)
+            continue
         raise RuntimeError(f"{image} failed rc={p.returncode}: {p.stderr[-400:]}")
     internal = None
     m = re.findall(r"total\s+([\d.]+)\s+ms", p.stderr)
@@ -49,23 +54,24 @@ def main():
         ]
         rounds = 2
     else:
-        img_new = sys.argv[2] if len(sys.argv) > 2 else "hyperion:v6"
-        img_base = sys.argv[3] if len(sys.argv) > 3 else "hyperion:v5.2"
+        img_new = sys.argv[2] if len(sys.argv) > 2 else "hyperion:v7"
+        img_base = sys.argv[3] if len(sys.argv) > 3 else "hyperion:v6.3-gcc14"
+        data_path = sys.argv[4] if len(sys.argv) > 4 else "/vol/p5"
         configs = [
             (img_base,      img_base,      {"HYPERION_PROFILE": "1"}),
             (img_new,       img_new,       {"HYPERION_PROFILE": "1"}),
             ("comp-mego74", "comp-mego74", {}),
         ]
-        rounds = 3
+        rounds = 5
 
     # Warmup
-    run_one(configs[0][1], configs[0][2])
+    run_one(configs[0][1], configs[0][2], data_path=data_path)
 
     res = {name: {"wall": [], "int": [], "last": ""} for name, _, _ in configs}
     for r in range(rounds):
         order = configs if (r % 2 == 0) else list(reversed(configs))
         for name, img, env in order:
-            w, i, err = run_one(img, env)
+            w, i, err = run_one(img, env, data_path=data_path)
             res[name]["wall"].append(w)
             if i is not None:
                 res[name]["int"].append(i)

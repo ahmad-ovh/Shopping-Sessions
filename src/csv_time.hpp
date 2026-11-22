@@ -397,6 +397,7 @@ struct StreamScanner {
             cumq += u64(__builtin_popcountll(qm));
             blk += 64;
             if (__builtin_expect(blk >= limit, 0)) { is_nl = true; return limit; }
+            __builtin_prefetch(base + blk + 512, 0, 0);
             block_masks64(base + blk, sm, nlm, qm);
         }
         u64 bit = sm & -sm;

@@ -355,20 +355,24 @@ struct LinkResolver {
             u32 id;
             u32 pad;
         };
+        struct alignas(16) DsuNode {
+            u64 lo;
+            std::atomic<u32> parent;
+            u8 dom;
+            u8 pad[3];
+        };
+        static_assert(sizeof(DsuNode) == 16);
 
-        AnonRegion tmp_regs[7];
+        AnonRegion tmp_regs[4];
         auto alloc_tmp = [&](int idx, size_t bytes) -> void* {
-            return huge_alloc(bytes, false, &tmp_regs[idx].ptr, &tmp_regs[idx].len);
+            return huge_alloc(bytes, true, &tmp_regs[idx].ptr, &tmp_regs[idx].len);
         };
 
         auto* s_nodes   = static_cast<ShortNodeSlot*>(alloc_tmp(0, size_t(scap) * sizeof(ShortNodeSlot)));
         auto* h_nodes   = static_cast<HexNodeSlot*>(alloc_tmp(1, size_t(hcap) * sizeof(HexNodeSlot)));
-        auto* node_lo   = static_cast<u64*>(alloc_tmp(2, size_t(max_nodes) * sizeof(u64)));
-        auto* node_dom  = static_cast<u8*>(alloc_tmp(3, size_t(max_nodes)));
-        auto* parent    = static_cast<std::atomic<u32>*>(alloc_tmp(4, size_t(max_nodes) * sizeof(std::atomic<u32>)));
-        auto* best      = static_cast<std::atomic<u32>*>(alloc_tmp(5, size_t(max_nodes) * sizeof(std::atomic<u32>)));
+        auto* nodes     = static_cast<DsuNode*>(alloc_tmp(2, size_t(max_nodes) * sizeof(DsuNode)));
         const u32 max_hex = u32(std::min<size_t>(hcap, 1u << 24));
-        auto* hex_vals  = static_cast<Hex128*>(alloc_tmp(6, size_t(max_hex) * sizeof(Hex128)));
+        auto* hex_vals  = static_cast<Hex128*>(alloc_tmp(3, size_t(max_hex) * sizeof(Hex128)));
 
         std::atomic<u32> hex_ctr{0};
         std::mutex exotic_mu;
@@ -376,18 +380,30 @@ struct LinkResolver {
         std::atomic<u32> node_ctr{0};
         std::atomic<u32> total_short_nodes{0};
         std::atomic<u32> total_hex_nodes{0};
+        std::atomic<u32> total_merges{0};
         std::atomic<size_t> next_ch{0};
 
         double t_p1 = prof.enabled ? now_sec() : 0.0;
         if (prof.enabled) prof.note("links:alloc", (t_p1 - t_alloc0) * 1000.0);
 
+        auto get_key = [&](u32 id) -> UserKey {
+            const DsuNode& nd = nodes[id];
+            u8 d = nd.dom;
+            if (__builtin_expect(d == DOM_SHORT, 1)) return {nd.lo, 0, DOM_SHORT};
+            if (d == DOM_HEX32) {
+                Hex128 h = hex_vals[nd.lo];
+                return {h.lo, h.hi, DOM_HEX32};
+            }
+            return {nd.lo, 0, DOM_EXOTIC};
+        };
+
         auto find_lf = [&](u32 x) -> u32 {
             while (true) {
-                u32 p = parent[x].load(std::memory_order_relaxed);
+                u32 p = nodes[x].parent.load(std::memory_order_relaxed);
                 if (p == x) return x;
-                u32 gp = parent[p].load(std::memory_order_relaxed);
+                u32 gp = nodes[p].parent.load(std::memory_order_relaxed);
                 if (gp != p) {
-                    parent[x].compare_exchange_weak(p, gp, std::memory_order_relaxed, std::memory_order_relaxed);
+                    nodes[x].parent.compare_exchange_weak(p, gp, std::memory_order_relaxed, std::memory_order_relaxed);
                 }
                 x = gp;
             }
@@ -400,7 +416,7 @@ struct LinkResolver {
                 cats.load_campaigns(data_dir + "/campaigns.csv");
             }
             u32 loc_cur = 0, loc_end = 0;
-            u32 loc_short = 0, loc_hex = 0;
+            u32 loc_short = 0, loc_hex = 0, loc_merges = 0;
 
             auto alloc_id = [&]() -> u32 {
                 if (__builtin_expect(loc_cur == loc_end, 0)) {
@@ -427,10 +443,9 @@ struct LinkResolver {
                                     std::memory_order_acq_rel, std::memory_order_relaxed)) {
                                 u32 id = alloc_id();
                                 ++loc_short;
-                                node_lo[id] = k.lo;
-                                node_dom[id] = DOM_SHORT;
-                                parent[id].store(id, std::memory_order_relaxed);
-                                best[id].store(id, std::memory_order_relaxed);
+                                nodes[id].lo = k.lo;
+                                nodes[id].dom = DOM_SHORT;
+                                nodes[id].parent.store(id, std::memory_order_relaxed);
                                 s_nodes[idx].id1.store(id + 1u, std::memory_order_release);
                                 return id;
                             }
@@ -461,10 +476,9 @@ struct LinkResolver {
                                 u32 hx_idx = hex_ctr.fetch_add(1, std::memory_order_relaxed);
                                 ++loc_hex;
                                 hex_vals[hx_idx] = {k.hi, k.lo};
-                                node_lo[id] = hx_idx;
-                                node_dom[id] = DOM_HEX32;
-                                parent[id].store(id, std::memory_order_relaxed);
-                                best[id].store(id, std::memory_order_relaxed);
+                                nodes[id].lo = hx_idx;
+                                nodes[id].dom = DOM_HEX32;
+                                nodes[id].parent.store(id, std::memory_order_relaxed);
                                 h_nodes[idx].hi = k.hi;
                                 h_nodes[idx].lo = k.lo;
                                 h_nodes[idx].id = id;
@@ -480,10 +494,9 @@ struct LinkResolver {
                 auto it = exotic_node_map.find(u32(k.lo));
                 if (it != exotic_node_map.end()) return it->second;
                 u32 id = alloc_id();
-                node_lo[id] = k.lo;
-                node_dom[id] = DOM_EXOTIC;
-                parent[id].store(id, std::memory_order_relaxed);
-                best[id].store(id, std::memory_order_relaxed);
+                nodes[id].lo = k.lo;
+                nodes[id].dom = DOM_EXOTIC;
+                nodes[id].parent.store(id, std::memory_order_relaxed);
                 exotic_node_map.emplace(u32(k.lo), id);
                 return id;
             };
@@ -514,10 +527,12 @@ struct LinkResolver {
                     u32 ra = find_lf(ia);
                     u32 rb = find_lf(ib);
                     while (ra != rb) {
-                        if (ra > rb) std::swap(ra, rb);
+                        // Union by byte-wise key order so root IS ALWAYS the canonical smallest UserKey!
+                        if (user_key_less(get_key(rb), get_key(ra), ex)) std::swap(ra, rb);
                         u32 expected = rb;
-                        if (parent[rb].compare_exchange_weak(expected, ra,
+                        if (nodes[rb].parent.compare_exchange_weak(expected, ra,
                                 std::memory_order_acq_rel, std::memory_order_acquire)) {
+                            ++loc_merges;
                             break;
                         }
                         ra = find_lf(ra);
@@ -556,67 +571,29 @@ struct LinkResolver {
             }
             if (nb > 0) flush_edges();
 
-            for (u32 u = loc_cur; u < loc_end; ++u) node_dom[u] = 255;
-            if (loc_short) total_short_nodes.fetch_add(loc_short, std::memory_order_relaxed);
-            if (loc_hex)   total_hex_nodes.fetch_add(loc_hex, std::memory_order_relaxed);
+            for (u32 u = loc_cur; u < loc_end; ++u) nodes[u].dom = 255;
+            if (loc_short)  total_short_nodes.fetch_add(loc_short, std::memory_order_relaxed);
+            if (loc_hex)    total_hex_nodes.fetch_add(loc_hex, std::memory_order_relaxed);
+            if (loc_merges) total_merges.fetch_add(loc_merges, std::memory_order_relaxed);
         });
 
         double t_p2 = prof.enabled ? now_sec() : 0.0;
         if (prof.enabled) prof.note("links:pass1", (t_p2 - t_p1) * 1000.0);
 
         const u32 total_slots = node_ctr.load(std::memory_order_relaxed);
-        if (total_slots == 0) {
-            for (int i = 0; i < 7; ++i) ::munmap(tmp_regs[i].ptr, tmp_regs[i].len);
+        const u32 n_merges = total_merges.load(std::memory_order_relaxed);
+        if (total_slots == 0 || n_merges == 0) {
             has_aliases = false;
             return;
         }
 
-        auto get_key = [&](u32 id) -> UserKey {
-            u8 d = node_dom[id];
-            if (__builtin_expect(d == DOM_SHORT, 1)) return {node_lo[id], 0, DOM_SHORT};
-            if (d == DOM_HEX32) {
-                Hex128 h = hex_vals[node_lo[id]];
-                return {h.lo, h.hi, DOM_HEX32};
-            }
-            return {node_lo[id], 0, DOM_EXOTIC};
-        };
-
-        // Pass 2: Parallel path compression + find byte-wise smallest name per component + count exact roots!
-        std::atomic<u32> num_roots{0};
-        pool.run([&](int tid) {
-            u32 lo = u32((u64(total_slots) * u64(tid)) / u64(nt));
-            u32 hi = u32((u64(total_slots) * u64(tid + 1)) / u64(nt));
-            u32 loc_roots = 0;
-            for (u32 i = lo; i < hi; ++i) {
-                if (node_dom[i] == 255) continue;
-                u32 r = i;
-                while (true) {
-                    u32 p = parent[r].load(std::memory_order_relaxed);
-                    if (p == r) break;
-                    r = p;
-                }
-                if (r == i) loc_roots++;
-                parent[i].store(r, std::memory_order_relaxed);
-                UserKey ki = get_key(i);
-                u32 cur_b = best[r].load(std::memory_order_relaxed);
-                while (cur_b != i && user_key_less(ki, get_key(cur_b), ex)) {
-                    if (best[r].compare_exchange_weak(cur_b, i,
-                            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                        break;
-                    }
-                }
-            }
-            if (loc_roots) num_roots.fetch_add(loc_roots, std::memory_order_relaxed);
-        });
-
-        double t_p3 = prof.enabled ? now_sec() : 0.0;
-        if (prof.enabled) prof.note("links:pass2", (t_p3 - t_p2) * 1000.0);
-
+        // Fused Pass 2+3: Since root is already the byte-wise smallest key per component,
+        // AND n_merges is the EXACT number of non-root aliases across all domains,
+        // we size Bloom + Compact Alias Tables tightly from n_merges in a SINGLE pass!
         has_aliases = true;
         u32 n_sn = total_short_nodes.load();
         u32 n_hn = total_hex_nodes.load();
-        u32 n_roots = num_roots.load();
-        u32 max_aliases = (n_sn + n_hn > n_roots) ? (n_sn + n_hn - n_roots) : 64u;
+        u32 max_aliases = std::max<u32>(n_merges, 64u);
         u32 bwords = 2048;
         while (u64(bwords) * 64ULL < u64(max_aliases) * 12ULL) bwords <<= 1;
         bloom_mask = bwords - 1u;
@@ -639,7 +616,6 @@ struct LinkResolver {
             hex_tab = static_cast<HexAliasSlot*>(huge_alloc(size_t(htab_cap) * sizeof(HexAliasSlot)));
         }
 
-        // Pass 3: Populate Bloom + Compact Alias Tables 100% lock-free in parallel!
         std::atomic<u32> ovf_ctr{0};
         auto* abloom = reinterpret_cast<std::atomic<u64>*>(bloom);
         auto* ashort = reinterpret_cast<std::atomic<u64>*>(short_tab);
@@ -674,18 +650,23 @@ struct LinkResolver {
             };
 
             for (u32 i = lo; i < hi; ++i) {
-                u8 d = node_dom[i];
+                const DsuNode& nd = nodes[i];
+                u8 d = nd.dom;
                 if (d == 255) continue;
-                u32 r = parent[i].load(std::memory_order_relaxed);
-                u32 b = best[r].load(std::memory_order_relaxed);
+                u32 b = i;
+                while (true) {
+                    u32 p = nodes[b].parent.load(std::memory_order_relaxed);
+                    if (p == b) break;
+                    b = p;
+                }
                 if (b == i) continue;
                 if (__builtin_expect(d == DOM_SHORT, 1)) {
-                    u64 akey = node_lo[i];
+                    u64 akey = nd.lo;
                     u64 h = hash_short(akey);
                     u64 cenc;
-                    u8 bd = node_dom[b];
-                    if (__builtin_expect(bd == DOM_SHORT, 1)) {
-                        cenc = node_lo[b];
+                    const DsuNode& nb_node = nodes[b];
+                    if (__builtin_expect(nb_node.dom == DOM_SHORT, 1)) {
+                        cenc = nb_node.lo;
                     } else {
                         u32 oid = ovf_ctr.fetch_add(1, std::memory_order_relaxed);
                         canon_overflow[oid] = get_key(b);
@@ -722,22 +703,9 @@ struct LinkResolver {
 
         double t_rel = prof.enabled ? now_sec() : 0.0;
         if (prof.enabled) {
-            prof.note("links:pass3", (t_rel - t_p3) * 1000.0);
-            std::fprintf(stderr, "  [sub] links:stats             est_e=%zu scap=%u hcap=%u sn=%u hn=%u roots=%u stab=%u htab=%u\n",
-                         est_edges, scap, hcap, n_sn, n_hn, n_roots, stab_cap, htab_cap);
-        }
-
-        // Release temporary DSU physical pages in parallel right away (saves ~100 MB RAM at 20M, ~300 MB at 60M!)
-        if (total_link_bytes > (1u << 20)) {
-            pool.run([&](int tid) {
-                for (int i = tid; i < 7; i += nt) {
-                    ::madvise(tmp_regs[i].ptr, tmp_regs[i].len, MADV_DONTNEED);
-                }
-            });
-            for (int i = 0; i < 7; ++i) ::munmap(tmp_regs[i].ptr, tmp_regs[i].len);
-            if (prof.enabled) prof.note("links:release_tmp", (now_sec() - t_rel) * 1000.0);
-        } else {
-            for (int i = 0; i < 7; ++i) ::munmap(tmp_regs[i].ptr, tmp_regs[i].len);
+            prof.note("links:pass2_fused", (t_rel - t_p2) * 1000.0);
+            std::fprintf(stderr, "  [sub] links:stats             est_e=%zu scap=%u hcap=%u sn=%u hn=%u stab=%u htab=%u\n",
+                         est_edges, scap, hcap, n_sn, n_hn, stab_cap, htab_cap);
         }
     }
 };

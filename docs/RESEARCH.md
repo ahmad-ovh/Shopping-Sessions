@@ -11,15 +11,13 @@
 - **v5 Rule Change (2026-11-22 02:08 UTC)**:
   - Replaced invertible scramble with a 6-round keyed Feistel bijection on `0..2^40` AND added **1-in-8 32-character lowercase hex suffixes** (`u` / `e` / `k` + 32 hex chars = 33 bytes).
   - Broke Team 67's `express-lane` key-recovery fast path (which scored 0.31s on v4) and exposed severe interner lock contention on 32-char hex IDs across the field.
-- **Live v5 Leaderboard Snapshot (2026-11-22 06:52 UTC)**:
-  - `#1 NoMoreLite`: **0.4508 s**
-  - `#2 LSU_i_Bosna_Najbolja`: **0.4527 s**
-  - `#3 @GMUNVIS`: **0.4581 s**
-  - `#4 67`: **0.4597 s**
-  - `#5 Caesar`: **0.4616 s**
-  - `#6 Wix`: **0.4669 s**
-  - `#7 ND`: **0.5051 s**
-  - `#8–#12`: **0.560–0.576 s**
+- **Live v5 Leaderboard Snapshot (2026-11-22 12:25 UTC)**:
+  - `#1 67`: **0.4218 s**
+  - `#2 JustOneGuy`: **0.4256 s**
+  - `#3 LSU_i_Bosna_Najbolja`: **0.4293 s**
+  - `#4 OhShi`: **0.4351 s**
+  - `#5 Wix`: **0.4428 s**
+  - *(Earlier 06:52 UTC snapshot: `#1 NoMoreLite 0.4508 s`, `#2 LSU_i_Bosna_Najbolja 0.4527 s`, `#3 @GMUNVIS 0.4581 s`)*
   - Baseline (PySpark): **168.86 s**
 
 ## 2. GitHub Reconnaissance (192 Repos Discovered, 32 Cloned & Audited)

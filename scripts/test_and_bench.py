@@ -43,13 +43,14 @@ def docker_run_bind(image: str, data_dir: Path, out_dir: Path, cpus="8", mem="14
         for k, v in extra_env.items():
             cmd += ["-e", f"{k}={v}"]
     cmd.append(image)
-    for attempt in range(3):
+    for attempt in range(4):
         t0 = time.perf_counter()
         p = subprocess.run(cmd, capture_output=True, text=True)
         dt = time.perf_counter() - t0
-        if p.returncode != 125:
+        if p.returncode == 0 or ("hyperion fatal" in p.stderr):
             break
-        time.sleep(2)
+        if attempt < 3:
+            time.sleep(2)
     return p, dt
 
 
@@ -162,9 +163,14 @@ def bench_p20(image: str, runs=5, profile=True):
         if profile and i == runs - 1:
             cmd += ["-e", "HYPERION_PROFILE=1"]
         cmd.append(image)
-        t0 = time.perf_counter()
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        dt = time.perf_counter() - t0
+        for attempt in range(4):
+            t0 = time.perf_counter()
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            dt = time.perf_counter() - t0
+            if p.returncode == 0 or ("hyperion fatal" in p.stderr):
+                break
+            if attempt < 3:
+                time.sleep(2)
         if p.returncode != 0:
             print(f"  run {i} FAILED rc={p.returncode}: {p.stderr[-500:]}")
             return None

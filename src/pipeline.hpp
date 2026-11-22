@@ -696,14 +696,23 @@ struct Pipeline {
         }
 
         // Pass 4b: Straight-line E dedup scatter (L1/L2-resident se_stage, zero P interference!)
+        // Precompute next record's hash 1 iteration ahead to prevent SSBD store-to-load stalls!
+        u32 q_nxt = (n > 0 && buf[0].eid_dom == DOM_SHORT)
+                    ? (u32(wyhash64(buf[0].eid_lo) >> 32) & dsmask) : 0u;
         for (int i = 0; i < n; ++i) {
             const PendEvent& pe = buf[i];
             if (__builtin_expect(pe.eid_dom == DOM_SHORT, 1)) {
-                u32 q = u32(wyhash64(pe.eid_lo) >> 32) & dsmask;
+                u32 q = q_nxt;
+                if (i + 1 < n && __builtin_expect(buf[i + 1].eid_dom == DOM_SHORT, 1)) {
+                    q_nxt = u32(wyhash64(buf[i + 1].eid_lo) >> 32) & dsmask;
+                }
                 w.emit_short_e(q, {pe.eid_lo, pe.ing_sec, locs[i]});
             } else {
                 u32 q = u32(wyhash128(pe.eid_hi, pe.eid_lo) >> 32) & dlmask;
                 w.emit_long_e(q, {pe.eid_hi, pe.eid_lo, pe.ing_sec, locs[i]});
+                if (i + 1 < n && buf[i + 1].eid_dom == DOM_SHORT) {
+                    q_nxt = u32(wyhash64(buf[i + 1].eid_lo) >> 32) & dsmask;
+                }
             }
         }
     }
@@ -1035,10 +1044,13 @@ struct Pipeline {
                     for (int t = 0; t < nt; ++t) {
                         for (ShortEBlock* b = workers[t].se_parts[q].head; b; b = b->next) {
                             const u32 bn = b->n;
+                            if (bn == 0) continue;
                             const ShortERec* rr = b->r;
+                            u32 nxt_idx = u32(wyhash64(rr[0].ekey)) & mask;
                             for (u32 i = 0; i < bn; ++i) {
-                                const ShortERec& e = rr[i];
-                                u32 idx = u32(wyhash64(e.ekey)) & mask;
+                                const ShortERec e = rr[i];
+                                u32 idx = nxt_idx;
+                                if (i + 1 < bn) nxt_idx = u32(wyhash64(rr[i + 1].ekey)) & mask;
                                 for (;;) {
                                     ShortERec& s = tab[idx];
                                     if (s.ekey == 0) {
@@ -1259,8 +1271,11 @@ struct Pipeline {
                 u32 est_ev = est_sp + est_lp + est_ep;
                 if (est_ev == 0) continue;
 
+                // Cap initial stab/otab so whale partitions (e.g. 400K events from 1 whale user + 1.3K normal users)
+                // stay in L1/L2 cache (64 KB) instead of allocating & memset-ing a 2 MB table!
+                // grow_stab()/grow_otab() automatically double if distinct persons exceed half capacity.
                 u32 scap = 128;
-                u32 swant = std::max<u32>(est_sp / 6u + 64u, 64u);
+                u32 swant = std::min<u32>(std::max<u32>(est_sp / 8u + 64u, 64u), 4096u);
                 while (scap < swant) scap <<= 1;
                 if (stab.size() < scap) stab.resize(scap);
                 std::memset(stab.data(), 0, size_t(scap) * sizeof(ShortLSlot));
@@ -1268,7 +1283,7 @@ struct Pipeline {
                 u32 s_used = 0;
 
                 u32 ocap = 64;
-                u32 owant = std::max<u32>((est_lp + est_ep) / 6u + 32u, 32u);
+                u32 owant = std::min<u32>(std::max<u32>((est_lp + est_ep) / 8u + 32u, 32u), 1024u);
                 while (ocap < owant) ocap <<= 1;
                 if (otab.size() < ocap) otab.resize(ocap);
                 for (u32 i = 0; i < ocap; ++i) otab[i].used = 0;
@@ -1455,8 +1470,19 @@ struct Pipeline {
                 std::memcpy(ev_cnt.data(), ev_off.data(), np * sizeof(u32));
                 u32* ec_ptr = ev_cnt.data();
                 u32* et_ptr = ev_ts.data();
-                for (u32 i = 0; i < n_live_ev; ++i) {
-                    et_ptr[ec_ptr[tp_out[i]]++] = tt_out[i];
+                u32 i_ev = 0;
+                for (; i_ev + 4 <= n_live_ev; i_ev += 4) {
+                    u32 p0 = tp_out[i_ev],     t0 = tt_out[i_ev];
+                    u32 p1 = tp_out[i_ev + 1], t1 = tt_out[i_ev + 1];
+                    u32 p2 = tp_out[i_ev + 2], t2 = tt_out[i_ev + 2];
+                    u32 p3 = tp_out[i_ev + 3], t3 = tt_out[i_ev + 3];
+                    u32 d0 = ec_ptr[p0]++; et_ptr[d0] = t0;
+                    u32 d1 = ec_ptr[p1]++; et_ptr[d1] = t1;
+                    u32 d2 = ec_ptr[p2]++; et_ptr[d2] = t2;
+                    u32 d3 = ec_ptr[p3]++; et_ptr[d3] = t3;
+                }
+                for (; i_ev < n_live_ev; ++i_ev) {
+                    et_ptr[ec_ptr[tp_out[i_ev]]++] = tt_out[i_ev];
                 }
 
                 // Purchases

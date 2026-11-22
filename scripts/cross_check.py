@@ -30,11 +30,12 @@ def run_img_to_dir(img, vol_sub, out_dir: Path):
         "-e", "NCPU=8", "-e", "MEM_GB=14",
         img,
     ]
-    for attempt in range(3):
+    for attempt in range(4):
         p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.returncode != 125:
+        if p.returncode == 0 or ("hyperion fatal" in p.stderr):
             break
-        import time; time.sleep(2)
+        if attempt < 3:
+            import time; time.sleep(2)
     if p.returncode != 0:
         raise RuntimeError(f"{img} failed rc={p.returncode}: {p.stderr[-500:]}")
 
