@@ -20,7 +20,11 @@
 #include <unistd.h>
 #include <vector>
 
-namespace hyp {
+#ifndef HYP_NS
+#define HYP_NS hyp
+#endif
+
+namespace HYP_NS {
 
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -66,6 +70,10 @@ struct Profiler {
                      label, (cur - last) * 1000.0, (cur - t0) * 1000.0);
         last = cur;
     }
+    void note(const char* label, double ms) const {
+        if (!enabled) return;
+        std::fprintf(stderr, "  [sub] %-23s %7.2f ms\n", label, ms);
+    }
 };
 
 // Fast 128-bit wyhash-style mixer (4 cycles, full 64-bit avalanche)
@@ -102,7 +110,7 @@ static inline u32 fastrange32(u32 hash, u32 range) {
     return u32((u64(hash) * u64(range)) >> 32);
 }
 
-// Runtime THP safety check: avoid MADV_HUGEPAGE if THP is disabled or defrag is "always"
+// Runtime THP safety check: avoid MADV_HUGEPAGE if THP is disabled
 inline bool thp_safe() {
     static int cached = -1;
     if (cached >= 0) return cached != 0;
@@ -127,7 +135,7 @@ inline bool thp_safe() {
     return true;
 }
 
-// Track anonymous mmap regions so we can optionally parallel-MADV_DONTNEED before _exit
+// Track anonymous mmap regions so we can parallel-MADV_DONTNEED before _exit
 struct AnonRegion {
     void* ptr;
     size_t len;
@@ -144,14 +152,13 @@ struct RegionTracker {
 
 inline RegionTracker g_regions;
 
-inline void* huge_alloc(size_t bytes, bool track = true) {
+inline void* huge_alloc(size_t bytes, bool track = true, void** out_raw = nullptr, size_t* out_raw_len = nullptr) {
     if (bytes == 0) bytes = 4096;
     constexpr size_t HP = 2u << 20;
     size_t rounded = (bytes + 4095u) & ~size_t(4095u);
     void* p = nullptr;
     size_t alloc_len = rounded;
     if (rounded >= HP && thp_safe()) {
-        // Over-allocate slightly to align to 2 MiB boundary for THP
         alloc_len = rounded + HP;
         void* raw = ::mmap(nullptr, alloc_len, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -161,22 +168,64 @@ inline void* huge_alloc(size_t bytes, bool track = true) {
 #ifdef MADV_HUGEPAGE
         ::madvise(p, rounded, MADV_HUGEPAGE);
 #endif
+        if (out_raw) *out_raw = raw;
+        if (out_raw_len) *out_raw_len = alloc_len;
         if (track) g_regions.record(raw, alloc_len);
         return p;
     }
     p = ::mmap(nullptr, alloc_len, PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) die("mmap alloc");
+    if (out_raw) *out_raw = p;
+    if (out_raw_len) *out_raw_len = alloc_len;
     if (track) g_regions.record(p, alloc_len);
     return p;
 }
 
+// Growable raw buffer backed by huge_alloc (MAP_NORESERVE): zero glibc 4KB faults, zero resize zero-fill!
+template <class T>
+struct HugeBuf {
+    T* ptr = nullptr;
+    size_t len = 0;
+    size_t cap = 0;
+
+    void init_reserve(size_t reserve_elems) {
+        if (ptr) return;
+        cap = reserve_elems < 1024 ? 1024 : reserve_elems;
+        ptr = static_cast<T*>(huge_alloc(cap * sizeof(T)));
+        len = 0;
+    }
+
+    inline void grow_to(size_t need) {
+        size_t ncap = cap ? cap : 1024;
+        while (ncap < need) ncap <<= 1;
+        T* np = static_cast<T*>(huge_alloc(ncap * sizeof(T)));
+        if (len > 0 && ptr) std::memcpy(np, ptr, len * sizeof(T));
+        ptr = np;
+        cap = ncap;
+    }
+
+    inline void ensure_extra(size_t extra) {
+        if (__builtin_expect(len + extra > cap, 0)) grow_to(len + extra);
+    }
+
+    inline void push(const T& v) {
+        if (__builtin_expect(len == cap, 0)) grow_to(len + 1);
+        ptr[len++] = v;
+    }
+
+    inline T* data() { return ptr; }
+    inline const T* data() const { return ptr; }
+    inline size_t size() const { return len; }
+    inline bool empty() const { return len == 0; }
+    inline void clear() { len = 0; }
+};
+
 // Bump-pointer block allocator backed by a single large MAP_NORESERVE huge-page virtual region
-// (1 mmap syscall per worker instead of hundreds, zero unused physical pages!)
 struct SlabArena {
     u8* cur = nullptr;
     u8* end = nullptr;
-    size_t reserve_bytes = 512ULL << 20; // virtual reservation (only touched pages fault!)
+    size_t reserve_bytes = 512ULL << 20;
 
     void* alloc(size_t bytes, size_t align = 64) {
         uintptr_t p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
@@ -193,7 +242,6 @@ struct SlabArena {
 };
 
 // Memory-mapped input file with >= 64 bytes of zeroed guard padding past EOF
-// so 64-byte SIMD loads never fault past file end.
 struct MFile {
     const u8* data = nullptr;
     size_t size = 0;
@@ -214,7 +262,6 @@ struct MFile {
             fd = -1;
             return true;
         }
-        // Reserve file size rounded up to page + 1 extra zero page
         size_t file_pages = (size + 4095u) & ~size_t(4095u);
         mapped = file_pages + 4096u;
         void* base = ::mmap(nullptr, mapped, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -222,17 +269,6 @@ struct MFile {
         void* m = ::mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
         if (m == MAP_FAILED) die("mmap file");
         data = static_cast<const u8*>(base);
-        return true;
-    }
-
-    bool open_fd(const std::string& path) {
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st;
-        if (::fstat(fd, &st) != 0) { ::close(fd); fd = -1; return false; }
-        size = size_t(st.st_size);
-        data = nullptr;
-        mapped = 0;
         return true;
     }
 
@@ -310,17 +346,4 @@ public:
     }
 };
 
-inline bool cpu_has_avx512bw() {
-#if defined(__x86_64__)
-    static int has = -1;
-    if (has >= 0) return has != 0;
-    has = (__builtin_cpu_supports("avx512f") &&
-           __builtin_cpu_supports("avx512bw") &&
-           __builtin_cpu_supports("avx512vl")) ? 1 : 0;
-    return has != 0;
-#else
-    return false;
-#endif
-}
-
-} // namespace hyp
+} // namespace HYP_NS

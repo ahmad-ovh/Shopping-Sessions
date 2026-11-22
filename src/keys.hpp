@@ -6,7 +6,7 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace hyp {
+namespace HYP_NS {
 
 // ============================================================================
 // Zero-Interning Lossless Dual-Width ID Encoding
@@ -144,7 +144,7 @@ static inline bool try_pack_short(const u8* p, size_t n, u64& out_word) {
     // and caller buffers are padded. Mask off bytes beyond tlen.
     u64 word;
     std::memcpy(&word, p + 1, 8);
-    const u64 mask = (tlen == 8) ? ~u64(0) : ((u64(1) << (tlen * 8)) - 1);
+    const u64 mask = ~u64(0) >> ((8u - tlen) * 8u);
     word &= mask;
     // Reject NUL (0) inside tlen bytes or any non-ASCII byte (>= 0x80)
     const u64 zero_bytes = (word - 0x0101010101010101ULL) & ~word & mask;
@@ -260,4 +260,4 @@ static inline UserKey encode_user_key(const u8* p, size_t n, ExoticInterner& ex)
     return {u64(ex.intern(p, n)), 0, DOM_EXOTIC};
 }
 
-} // namespace hyp
+} // namespace HYP_NS

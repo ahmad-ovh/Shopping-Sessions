@@ -5,9 +5,19 @@ RUN apt-get update \
 WORKDIR /src
 COPY src/ ./src/
 RUN g++ -std=c++20 -O3 -march=x86-64-v3 -mtune=cascadelake \
-        -flto -fno-exceptions -fno-rtti -fno-plt -static -pthread \
+        -fno-exceptions -fno-rtti -fno-plt -pthread \
         -Wall -Wextra -Wno-unused-parameter \
-        src/main.cpp -o /hyperion \
+        -c src/entry_avx2.cpp -o /tmp/entry_avx2.o \
+ && g++ -std=c++20 -O3 -march=cascadelake -Wa,-mbranches-within-32B-boundaries \
+        -fno-exceptions -fno-rtti -fno-plt -pthread \
+        -Wall -Wextra -Wno-unused-parameter \
+        -c src/entry_avx512.cpp -o /tmp/entry_avx512.o \
+ && g++ -std=c++20 -O3 -march=x86-64-v2 \
+        -fno-exceptions -fno-rtti -fno-plt -pthread \
+        -Wall -Wextra -Wno-unused-parameter \
+        -c src/main.cpp -o /tmp/main.o \
+ && g++ -static -pthread -O3 \
+        /tmp/main.o /tmp/entry_avx2.o /tmp/entry_avx512.o -o /hyperion \
  && strip /hyperion
 
 FROM scratch
