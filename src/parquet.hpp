@@ -413,8 +413,9 @@ struct UserDailyCols {
     std::vector<i32> day;
     std::vector<i32> sessions;
     std::vector<i32> events;
-    std::vector<i64> revenue_cents;
-    i64 max_rev = 0;
+    std::vector<i32> rev32;
+    std::vector<i64> rev64; // only allocated if any row exceeds INT32_MAX!
+    bool use_rev64 = false;
 
     // top_category: def_levels (0=null, 1=present) + non-null category IDs
     std::vector<u8> cat_def;
@@ -426,7 +427,7 @@ struct UserDailyCols {
         day.reserve(est_rows);
         sessions.reserve(est_rows);
         events.reserve(est_rows);
-        revenue_cents.reserve(est_rows);
+        rev32.reserve(est_rows);
         cat_def.reserve(est_rows);
         cat_idx.reserve(est_rows / 4 + 64);
     }
@@ -443,8 +444,19 @@ struct UserDailyCols {
         day.push_back(d);
         sessions.push_back(s);
         events.push_back(e);
-        revenue_cents.push_back(rev);
-        if (rev > max_rev) max_rev = rev;
+        if (__builtin_expect(!use_rev64, 1)) {
+            if (__builtin_expect(rev <= INT32_MAX, 1)) {
+                rev32.push_back(i32(rev));
+            } else {
+                use_rev64 = true;
+                rev64.reserve(rev32.capacity());
+                for (i32 v : rev32) rev64.push_back(i64(v));
+                rev64.push_back(rev);
+                rev32.clear();
+            }
+        } else {
+            rev64.push_back(rev);
+        }
         if (top_cat >= 0) {
             cat_def.push_back(1);
             cat_idx.push_back(u16(top_cat));
@@ -458,7 +470,7 @@ struct UserDailyCols {
         fw.write_bytes("PAR1", 4);
 
         const i64 nrows = i64(day.size());
-        const bool rev_i32 = (max_rev <= INT32_MAX);
+        const bool rev_i32 = !use_rev64;
         std::vector<ColSchema> schema = {
             {"user_id",       TYPE_BYTE_ARRAY, CONV_UTF8, REP_REQUIRED},
             {"day",           TYPE_INT32,      CONV_DATE, REP_REQUIRED},
@@ -536,18 +548,16 @@ struct UserDailyCols {
                 cm.data_page_offset = fw.pos();
                 if (rev_i32) {
                     cm.phys_type = TYPE_INT32;
-                    std::vector<i32> tmp(revenue_cents.size());
-                    for (size_t i = 0; i < revenue_cents.size(); ++i) tmp[i] = i32(revenue_cents[i]);
-                    i32 sz = i32(tmp.size() * 4);
+                    i32 sz = i32(rev32.size() * 4);
                     write_page_header_data(hdr, sz, i32(nrows), ENC_PLAIN);
                     fw.write_bytes(hdr.data.data(), hdr.size());
-                    fw.write_bytes(tmp.data(), size_t(sz));
+                    fw.write_bytes(rev32.data(), size_t(sz));
                 } else {
                     cm.phys_type = TYPE_INT64;
-                    i32 sz = i32(revenue_cents.size() * 8);
+                    i32 sz = i32(rev64.size() * 8);
                     write_page_header_data(hdr, sz, i32(nrows), ENC_PLAIN);
                     fw.write_bytes(hdr.data.data(), hdr.size());
-                    fw.write_bytes(revenue_cents.data(), size_t(sz));
+                    fw.write_bytes(rev64.data(), size_t(sz));
                 }
                 cm.total_size = fw.pos() - cm.data_page_offset;
                 metas.push_back(std::move(cm));

@@ -171,20 +171,20 @@ inline void* huge_alloc(size_t bytes, bool track = true) {
     return p;
 }
 
-// Bump-pointer block allocator backed by 2 MiB slabs
+// Bump-pointer block allocator backed by a single large MAP_NORESERVE huge-page virtual region
+// (1 mmap syscall per worker instead of hundreds, zero unused physical pages!)
 struct SlabArena {
     u8* cur = nullptr;
     u8* end = nullptr;
-    size_t slab_bytes = 4u << 20;
+    size_t reserve_bytes = 512ULL << 20; // virtual reservation (only touched pages fault!)
 
     void* alloc(size_t bytes, size_t align = 64) {
         uintptr_t p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
         if (__builtin_expect(p + bytes > uintptr_t(end), 0)) {
             size_t need = bytes + align;
-            size_t sz = need > slab_bytes ? ((need + (2u << 20) - 1) & ~((2u << 20) - 1)) : slab_bytes;
+            size_t sz = need > reserve_bytes ? ((need + (2u << 20) - 1) & ~((2u << 20) - 1)) : reserve_bytes;
             cur = static_cast<u8*>(huge_alloc(sz));
             end = cur + sz;
-            if (slab_bytes < (16u << 20)) slab_bytes <<= 1;
             p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
         }
         cur = reinterpret_cast<u8*>(p + bytes);

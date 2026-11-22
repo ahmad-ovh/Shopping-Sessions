@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -15,52 +16,70 @@
 namespace hyp {
 
 // ============================================================================
-// Data Records & Block Streams
+// Cache-Line-Packed Records & Write-Combining Staging Buffers
 // ============================================================================
 
-// Short canonical user event block: 336 * (8 + 4) + 16 = 4048 B (fits in 1 4KB page!)
-static constexpr u32 SHORT_PBLK_CAP = 336;
+// 5 ShortP events packed into ONE 64-byte cache line (40 + 20 + 4 = 64 B)!
+// Both ukey[i] and ts[i] share the EXACT same cache line (halves cache misses!).
+struct alignas(64) ShortPGroup5 {
+    u64 ukey[5];
+    u32 ts[5];
+    u32 count; // 1..5 valid entries in this group
+};
+static_assert(sizeof(ShortPGroup5) == 64);
+
+static constexpr u32 SHORT_PBLK_GROUPS = 63; // 63 * 64 + 64 = 4096 B exact!
+static constexpr u32 SHORT_PBLK_CAP    = SHORT_PBLK_GROUPS * 5; // 315 events/block
 struct alignas(64) ShortPBlock {
     ShortPBlock* next;
-    u32 n;
-    u32 pad;
-    u64 ukey[SHORT_PBLK_CAP];
-    u32 ts[SHORT_PBLK_CAP];
+    u32 ngroups;
+    u32 idx;
+    u32 pad[12];
+    ShortPGroup5 g[SHORT_PBLK_GROUPS];
 };
+static_assert(sizeof(ShortPBlock) == 4096);
 
-// Long-hex canonical user event block (12.5% of events)
-static constexpr u32 LONG_PBLK_CAP = 168;
+// Long-hex canonical user event block (12.5% of events; 1 KB block minimizes trailing waste!)
+struct LongPRec {
+    u64 hi;
+    u64 lo;
+    u32 ts;
+    u32 pad;
+};
+static constexpr u32 LONG_PBLK_CAP = 40;
 struct alignas(64) LongPBlock {
     LongPBlock* next;
     u32 n;
-    u32 pad;
-    u64 hi[LONG_PBLK_CAP];
-    u64 lo[LONG_PBLK_CAP];
-    u32 ts[LONG_PBLK_CAP];
+    u32 idx;
+    u32 pad[12];
+    LongPRec r[LONG_PBLK_CAP];
 };
 
 // Exotic canonical user event block (<0.01% of events + fixtures)
-static constexpr u32 EXOTIC_PBLK_CAP = 256;
+struct ExoticPRec {
+    u32 eid;
+    u32 ts;
+};
+static constexpr u32 EXOTIC_PBLK_CAP = 30;
 struct alignas(64) ExoticPBlock {
     ExoticPBlock* next;
     u32 n;
-    u32 pad;
-    u32 eid[EXOTIC_PBLK_CAP];
-    u32 ts[EXOTIC_PBLK_CAP];
+    u32 idx;
+    ExoticPRec r[EXOTIC_PBLK_CAP];
 };
 
-// Purchase side-stream (only ~3% of valid events!)
+// Purchase side-stream (only ~3% of valid events! 1 KB blocks!)
 struct PurchRec {
     u64 u_lo;
     u64 u_hi;
     u32 ts;
     u32 price;
-    u32 ploc;    // back-pointer to its PRec so dead duplicates are skipped in O(1)!
+    u32 ploc;
     u16 cat;
     u8  u_dom;
     u8  pad;
 };
-static constexpr u32 PURCH_BLK_CAP = 126;
+static constexpr u32 PURCH_BLK_CAP = 30;
 struct alignas(64) PurchBlock {
     PurchBlock* next;
     u32 n;
@@ -72,12 +91,12 @@ struct alignas(64) PurchBlock {
 struct ClickRec {
     u64 u_lo;
     u64 u_hi;
-    u32 ts;        // ts - click_start
-    u32 camp_dom;  // (u_dom << 30) | camp_idx
-    u32 file_len;  // (file_idx << 20) | (cid_len & 0xFFFFF)
-    u32 cid_off;   // byte offset of click_id in click_files[file_idx]
+    u32 ts;
+    u32 camp_dom;
+    u32 file_len;
+    u32 cid_off;
 };
-static constexpr u32 CLICK_BLK_CAP = 126;
+static constexpr u32 CLICK_BLK_CAP = 30;
 struct alignas(64) ClickBlock {
     ClickBlock* next;
     u32 n;
@@ -85,19 +104,23 @@ struct alignas(64) ClickBlock {
     ClickRec r[CLICK_BLK_CAP];
 };
 
-// Exact disjoint dedup records
+// Exact disjoint dedup records (4 x 16B ShortERec = 1 cache line!)
 struct ShortERec {
     u64 ekey;    // DOM_SHORT exact 64-bit raw key (always non-zero)
     u32 ing_sec; // ingest_ts_sec - ing_origin_sec
     u32 loc;     // back-pointer to PRec (or INVALID_LOC)
 };
-static constexpr u32 SHORT_EBLK_CAP = 254;
+struct alignas(64) ShortEGroup4 {
+    ShortERec r[4];
+};
+static constexpr u32 SHORT_EBLK_GROUPS = 63; // 63 * 64 + 64 = 4096 B exact!
 struct alignas(64) ShortEBlock {
     ShortEBlock* next;
-    u32 n;
-    u32 pad;
-    ShortERec r[SHORT_EBLK_CAP];
+    u32 n; // total ShortERecs stored in this block
+    u32 pad[13];
+    ShortERec r[SHORT_EBLK_GROUPS * 4]; // 252 records
 };
+static_assert(sizeof(ShortEBlock) == 4096);
 
 struct LongERec {
     u64 hi;
@@ -119,10 +142,17 @@ struct ExoticERec {
     i64 ing_ms;
 };
 
-// Loc packing: [dom: 2 bits | tid: 4 bits | seq: 26 bits]
-// Supports up to 16 threads and 67M events per thread per domain (536M events on 8 threads).
 static inline u32 pack_loc(u8 dom, int tid, u32 seq) {
     return (u32(dom) << 30) | (u32(tid) << 26) | seq;
+}
+
+static inline void copy64(void* dst, const void* src) {
+    const __m256i* s = reinterpret_cast<const __m256i*>(src);
+    __m256i* d = reinterpret_cast<__m256i*>(dst);
+    __m256i v0 = _mm256_load_si256(s);
+    __m256i v1 = _mm256_load_si256(s + 1);
+    _mm256_store_si256(d, v0);
+    _mm256_store_si256(d + 1, v1);
 }
 
 template <class Block>
@@ -140,40 +170,44 @@ struct CampDayStat {
     i64 revenue_cents = 0;
 };
 
-// Per-worker state (cache-line separated)
 struct alignas(64) Worker {
     int tid = 0;
     SlabArena p_arena;
     SlabArena e_arena;
 
-    // Indexed vectors of all emitted PBlocks for O(1) loc -> ts_slot lookup during dedup kill!
-    std::vector<ShortPBlock*> short_pidx;
-    std::vector<LongPBlock*>  long_pidx;
+    std::vector<ShortPBlock*>  short_pidx;
+    std::vector<LongPBlock*>   long_pidx;
     std::vector<ExoticPBlock*> exotic_pidx;
 
-    // Partitioned person streams (size = g_P)
+    // L1-resident write-combining staging buffers for ShortP (P * 64 B = 32 KB!)
+    ShortPGroup5* sp_stage = nullptr;
+    // L2-resident write-combining staging buffers for ShortE (DS * 64 B = 64 KB!)
+    ShortEGroup4* se_stage = nullptr;
+    std::vector<u8> se_stage_n;
+
     std::vector<BlockList<ShortPBlock>>  sp_parts;
     std::vector<BlockList<LongPBlock>>   lp_parts;
     std::vector<BlockList<ExoticPBlock>> ep_parts;
     std::vector<BlockList<PurchBlock>>   pu_parts;
     std::vector<BlockList<ClickBlock>>   ck_parts;
 
-    // Partitioned dedup streams
-    std::vector<BlockList<ShortEBlock>> se_parts; // size = g_DS
-    std::vector<BlockList<LongEBlock>>  le_parts; // size = g_DL
+    std::vector<BlockList<ShortEBlock>> se_parts;
+    std::vector<BlockList<LongEBlock>>  le_parts;
     std::vector<ExoticERec> exotic_erecs;
 
-    // Reusable per-worker scratch for dedup & sessions
     std::vector<ShortERec> dtab_short;
     std::vector<LongERec>  dtab_long;
     std::vector<u8>        dtab_long_used;
 
-    // Per-worker outputs
     pq::UserDailyCols ud_cols;
-    std::vector<CampDayStat> cd_stats; // [(ncamp + 1) * ndays]
+    std::vector<CampDayStat> cd_stats;
+
+    u32 P_ = 0, DS_ = 0;
 
     void init(int id, u32 P, u32 DS, u32 DL, u32 ncamp_plus1, u32 ndays) {
         tid = id;
+        P_ = P;
+        DS_ = DS;
         sp_parts.resize(P);
         lp_parts.resize(P);
         ep_parts.resize(P);
@@ -181,30 +215,73 @@ struct alignas(64) Worker {
         ck_parts.resize(P);
         se_parts.resize(DS);
         le_parts.resize(DL);
+        sp_stage = static_cast<ShortPGroup5*>(p_arena.alloc(size_t(P) * sizeof(ShortPGroup5), 64));
+        for (u32 i = 0; i < P; ++i) sp_stage[i].count = 0;
+        se_stage = static_cast<ShortEGroup4*>(e_arena.alloc(size_t(DS) * sizeof(ShortEGroup4), 64));
+        se_stage_n.assign(DS, 0);
         short_pidx.reserve(16384);
         long_pidx.reserve(4096);
         exotic_pidx.reserve(64);
         cd_stats.assign(size_t(ncamp_plus1) * size_t(ndays), CampDayStat{});
     }
 
-    inline u32 emit_short_p(u32 p, u64 ukey, u32 ts) {
+    inline ShortPBlock* ensure_sp_blk(u32 p) {
         auto& lst = sp_parts[p];
         ShortPBlock* b = lst.tail;
-        if (__builtin_expect(!b || b->n == SHORT_PBLK_CAP, 0)) {
+        if (__builtin_expect(!b || b->ngroups == SHORT_PBLK_GROUPS, 0)) {
             b = static_cast<ShortPBlock*>(p_arena.alloc(sizeof(ShortPBlock), 64));
             b->next = nullptr;
-            b->n = 0;
-            b->pad = u32(short_pidx.size());
+            b->ngroups = 0;
+            b->idx = u32(short_pidx.size());
             short_pidx.push_back(b);
             if (lst.tail) lst.tail->next = b;
             else lst.head = b;
             lst.tail = b;
         }
-        u32 slot = b->n++;
-        b->ukey[slot] = ukey;
-        b->ts[slot] = ts;
-        lst.total++;
-        return pack_loc(DOM_SHORT, tid, b->pad * SHORT_PBLK_CAP + slot);
+        return b;
+    }
+
+    inline u32 emit_short_p(u32 p, u64 ukey, u32 ts) {
+        ShortPBlock* b = ensure_sp_blk(p);
+        ShortPGroup5& st = sp_stage[p];
+        u32 slot = st.count++;
+        st.ukey[slot] = ukey;
+        st.ts[slot] = ts;
+        sp_parts[p].total++;
+        u32 loc = pack_loc(DOM_SHORT, tid, (b->idx * SHORT_PBLK_GROUPS + b->ngroups) * 5u + slot);
+        if (__builtin_expect(slot == 4, 0)) {
+            copy64(&b->g[b->ngroups++], &st);
+            st.count = 0;
+        }
+        return loc;
+    }
+
+    inline void flush_all_stages() {
+        for (u32 p = 0; p < P_; ++p) {
+            if (sp_stage[p].count > 0) {
+                ShortPBlock* b = ensure_sp_blk(p);
+                copy64(&b->g[b->ngroups++], &sp_stage[p]);
+                sp_stage[p].count = 0;
+            }
+        }
+        for (u32 q = 0; q < DS_; ++q) {
+            u8 cnt = se_stage_n[q];
+            if (cnt > 0) {
+                auto& lst = se_parts[q];
+                ShortEBlock* b = lst.tail;
+                if (!b || b->n + cnt > SHORT_EBLK_GROUPS * 4u) {
+                    b = static_cast<ShortEBlock*>(e_arena.alloc(sizeof(ShortEBlock), 64));
+                    b->next = nullptr;
+                    b->n = 0;
+                    if (lst.tail) lst.tail->next = b;
+                    else lst.head = b;
+                    lst.tail = b;
+                }
+                std::memcpy(&b->r[b->n], &se_stage[q].r[0], size_t(cnt) * sizeof(ShortERec));
+                b->n += cnt;
+                se_stage_n[q] = 0;
+            }
+        }
     }
 
     inline u32 emit_long_p(u32 p, u64 hi, u64 lo, u32 ts) {
@@ -214,18 +291,16 @@ struct alignas(64) Worker {
             b = static_cast<LongPBlock*>(p_arena.alloc(sizeof(LongPBlock), 64));
             b->next = nullptr;
             b->n = 0;
-            b->pad = u32(long_pidx.size());
+            b->idx = u32(long_pidx.size());
             long_pidx.push_back(b);
             if (lst.tail) lst.tail->next = b;
             else lst.head = b;
             lst.tail = b;
         }
         u32 slot = b->n++;
-        b->hi[slot] = hi;
-        b->lo[slot] = lo;
-        b->ts[slot] = ts;
+        b->r[slot] = {hi, lo, ts, 0};
         lst.total++;
-        return pack_loc(DOM_HEX32, tid, b->pad * LONG_PBLK_CAP + slot);
+        return pack_loc(DOM_HEX32, tid, b->idx * LONG_PBLK_CAP + slot);
     }
 
     inline u32 emit_exotic_p(u32 p, u32 eid, u32 ts) {
@@ -235,17 +310,16 @@ struct alignas(64) Worker {
             b = static_cast<ExoticPBlock*>(p_arena.alloc(sizeof(ExoticPBlock), 64));
             b->next = nullptr;
             b->n = 0;
-            b->pad = u32(exotic_pidx.size());
+            b->idx = u32(exotic_pidx.size());
             exotic_pidx.push_back(b);
             if (lst.tail) lst.tail->next = b;
             else lst.head = b;
             lst.tail = b;
         }
         u32 slot = b->n++;
-        b->eid[slot] = eid;
-        b->ts[slot] = ts;
+        b->r[slot] = {eid, ts};
         lst.total++;
-        return pack_loc(DOM_EXOTIC, tid, b->pad * EXOTIC_PBLK_CAP + slot);
+        return pack_loc(DOM_EXOTIC, tid, b->idx * EXOTIC_PBLK_CAP + slot);
     }
 
     inline void emit_purch(u32 p, const PurchRec& pr) {
@@ -279,18 +353,24 @@ struct alignas(64) Worker {
     }
 
     inline void emit_short_e(u32 q, const ShortERec& er) {
-        auto& lst = se_parts[q];
-        ShortEBlock* b = lst.tail;
-        if (__builtin_expect(!b || b->n == SHORT_EBLK_CAP, 0)) {
-            b = static_cast<ShortEBlock*>(e_arena.alloc(sizeof(ShortEBlock), 64));
-            b->next = nullptr;
-            b->n = 0;
-            if (lst.tail) lst.tail->next = b;
-            else lst.head = b;
-            lst.tail = b;
+        u8 slot = se_stage_n[q]++;
+        se_stage[q].r[slot] = er;
+        se_parts[q].total++;
+        if (__builtin_expect(slot == 3, 0)) {
+            auto& lst = se_parts[q];
+            ShortEBlock* b = lst.tail;
+            if (__builtin_expect(!b || b->n == SHORT_EBLK_GROUPS * 4u, 0)) {
+                b = static_cast<ShortEBlock*>(e_arena.alloc(sizeof(ShortEBlock), 64));
+                b->next = nullptr;
+                b->n = 0;
+                if (lst.tail) lst.tail->next = b;
+                else lst.head = b;
+                lst.tail = b;
+            }
+            copy64(&b->r[b->n], &se_stage[q]);
+            b->n += 4u;
+            se_stage_n[q] = 0;
         }
-        b->r[b->n++] = er;
-        lst.total++;
     }
 
     inline void emit_long_e(u32 q, const LongERec& er) {
@@ -322,9 +402,10 @@ struct Pipeline {
     i64 window_end = 0;
     i64 click_start = 0;
     i64 base_day = 0;
+    u32 ws_mod = 0;
     u32 num_days = 1;
     i64 ing_origin_sec = 0;
-    u32 num_bins = 0; // 30-min bins covering [window_start, window_end)
+    u32 num_bins = 0;
 
     FastTime ftime;
     Catalogs cats;
@@ -336,7 +417,7 @@ struct Pipeline {
     std::vector<MFile> event_files;
     std::vector<MFile> click_files;
 
-    u32 P = 1024;
+    u32 P = 512;
     u32 DS = 1024;
     u32 DL = 256;
 
@@ -348,13 +429,17 @@ struct Pipeline {
         int tid = int((loc >> 26) & 0xFu);
         u32 seq = loc & ((1u << 26) - 1u);
         Worker& w = workers[tid];
-        if (dom == DOM_SHORT) {
-            return &w.short_pidx[seq / SHORT_PBLK_CAP]->ts[seq % SHORT_PBLK_CAP];
+        if (__builtin_expect(dom == DOM_SHORT, 1)) {
+            u32 blk = seq / SHORT_PBLK_CAP;
+            u32 rem = seq - blk * SHORT_PBLK_CAP;
+            u32 grp = rem / 5u;
+            u32 slt = rem - grp * 5u;
+            return &w.short_pidx[blk]->g[grp].ts[slt];
         }
         if (dom == DOM_HEX32) {
-            return &w.long_pidx[seq / LONG_PBLK_CAP]->ts[seq % LONG_PBLK_CAP];
+            return &w.long_pidx[seq / LONG_PBLK_CAP]->r[seq % LONG_PBLK_CAP].ts;
         }
-        return &w.exotic_pidx[seq / EXOTIC_PBLK_CAP]->ts[seq % EXOTIC_PBLK_CAP];
+        return &w.exotic_pidx[seq / EXOTIC_PBLK_CAP]->r[seq % EXOTIC_PBLK_CAP].ts;
     }
 
     inline void kill_loc(u32 loc) {
@@ -398,13 +483,9 @@ struct Pipeline {
         u8 hit[64];
 
         if (check_links) {
-            // Pass 1: Prefetch Bloom filter words for all buffered events
             for (int i = 0; i < n; ++i) {
-                if (buf[i].raw_user.dom != DOM_EXOTIC) {
-                    links.prefetch_bloom(buf[i].uhash);
-                }
+                if (buf[i].raw_user.dom != DOM_EXOTIC) links.prefetch_bloom(buf[i].uhash);
             }
-            // Pass 2: Check Bloom filter and prefetch alias table ONLY for hits (~35-40%)
             for (int i = 0; i < n; ++i) {
                 u8 d = buf[i].raw_user.dom;
                 if (d == DOM_SHORT) {
@@ -421,7 +502,10 @@ struct Pipeline {
             }
         }
 
-        // Pass 3: Resolve canonical person -> scatter directly to person partition + dedup bucket!
+        const u32 pmask = P - 1u;
+        const u32 dsmask = DS - 1u;
+        const u32 dlmask = DL - 1u;
+
         for (int i = 0; i < n; ++i) {
             const PendEvent& pe = buf[i];
             UserKey canon = pe.raw_user;
@@ -438,7 +522,7 @@ struct Pipeline {
 
             u64 ch = (canon.dom == pe.raw_user.dom && canon.lo == pe.raw_user.lo && canon.hi == pe.raw_user.hi)
                      ? pe.uhash : hash_user_key(canon);
-            u32 p = u32(ch >> 32) & (P - 1u);
+            u32 p = u32(ch >> 32) & pmask;
 
             u32 loc;
             if (__builtin_expect(canon.dom == DOM_SHORT, 1)) {
@@ -454,10 +538,10 @@ struct Pipeline {
             }
 
             if (__builtin_expect(pe.eid_dom == DOM_SHORT, 1)) {
-                u32 q = u32(wyhash64(pe.eid_lo) >> 32) & (DS - 1u);
+                u32 q = u32(wyhash64(pe.eid_lo) >> 32) & dsmask;
                 w.emit_short_e(q, {pe.eid_lo, pe.ing_sec, loc});
             } else if (pe.eid_dom == DOM_HEX32) {
-                u32 q = u32(wyhash128(pe.eid_hi, pe.eid_lo) >> 32) & (DL - 1u);
+                u32 q = u32(wyhash128(pe.eid_hi, pe.eid_lo) >> 32) & dlmask;
                 w.emit_long_e(q, {pe.eid_hi, pe.eid_lo, pe.ing_sec, loc});
             } else {
                 w.exotic_erecs.push_back({u32(pe.eid_lo), loc, pe.ing_ms});
@@ -490,6 +574,7 @@ struct Pipeline {
             }
         }
 
+        const u32 pmask = P - 1u;
         for (int i = 0; i < n; ++i) {
             const PendClick& pc = buf[i];
             UserKey canon = pc.raw_user;
@@ -505,19 +590,19 @@ struct Pipeline {
             }
             u64 ch = (canon.dom == pc.raw_user.dom && canon.lo == pc.raw_user.lo && canon.hi == pc.raw_user.hi)
                      ? pc.uhash : hash_user_key(canon);
-            u32 p = u32(ch >> 32) & (P - 1u);
+            u32 p = u32(ch >> 32) & pmask;
             u32 camp_dom = (u32(canon.dom) << 30) | pc.camp;
             w.emit_click(p, {canon.lo, canon.hi, pc.ts_rel, camp_dom, pc.file_len, pc.cid_off});
         }
     }
 
     void parse_events_and_clicks(ThreadPool& pool) {
-        struct Task { u8 kind; u32 file; size_t s, e; }; // kind 0 = event, 1 = click
+        struct Task { u8 kind; u32 file; size_t s, e; };
         std::vector<Task> tasks;
         tasks.reserve(2048);
 
         auto add_tasks = [&](u8 kind, const std::vector<MFile>& files) {
-            constexpr size_t CSZ = 2u << 20; // 2 MiB chunks
+            constexpr size_t CSZ = 2u << 20;
             for (u32 fi = 0; fi < files.size(); ++fi) {
                 const MFile& mf = files[fi];
                 if (mf.size == 0) continue;
@@ -560,25 +645,35 @@ struct Pipeline {
                 }
 
                 if (tk.kind == 0) {
-                    // Events CSV: event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
                     scan_csv<7>(mf.data, s, e, [&](const Field fl[7]) {
-                        // Step 1: Drop empty event_id
                         if (__builtin_expect(fl[0].n == 0, 0)) return;
 
-                        // Parse ingest_ts (rules.md: always valid F1; if ever bad, drop)
-                        i64 ing_ms = ftime.parse_f1(fl[3].p, fl[3].n);
-                        if (__builtin_expect(ing_ms == INVALID_TS, 0)) {
-                            // General fallback just in case
+                        // Ultra-fast SWAR F1 ingest_ts parser (zero hash, zero date loop!)
+                        i64 ing_sec_abs = ftime.parse_ingest_sec(fl[3].p, fl[3].n);
+                        i64 ing_ms;
+                        bool ing_compact;
+                        i64 ing_diff = 0;
+                        if (__builtin_expect(ing_sec_abs != INVALID_TS, 1)) {
+                            ing_ms = ing_sec_abs * 1000LL;
+                            ing_diff = ing_sec_abs - ing_origin_sec;
+                            ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL);
+                        } else {
                             ing_ms = parse_ts_general(fl[3].p, fl[3].n);
                             if (ing_ms == INVALID_TS) return;
+                            ing_diff = (ing_ms / 1000LL) - ing_origin_sec;
+                            ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL && (ing_ms % 1000LL) == 0);
                         }
-                        i64 ing_diff = (ing_ms / 1000LL) - ing_origin_sec;
-                        bool ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL && (ing_ms % 1000LL) == 0);
 
-                        // Encode event_id into exact disjoint domain
+                        bool valid = (fl[1].n > 0 && fl[5].n > 0);
+                        i64 ts = INVALID_TS;
+                        if (__builtin_expect(valid, 1)) {
+                            ts = ftime.parse(fl[2].p, fl[2].n);
+                            valid = (ts >= window_start && ts < window_end && (ing_ms - ts) <= DAY_MS);
+                        }
+
                         u64 eid_lo = 0, eid_hi = 0;
                         u8 eid_dom = DOM_EXOTIC;
-                        if (ing_compact) {
+                        if (__builtin_expect(ing_compact, 1)) {
                             u64 sw;
                             if (try_pack_short<'e'>(fl[0].p, fl[0].n, sw)) {
                                 eid_lo = sw;
@@ -596,17 +691,9 @@ struct Pipeline {
                             eid_lo = event_exotic.intern(fl[0].p, fl[0].n);
                         }
 
-                        // Step 3 & 4: Validate fields (NOTE: invalid copy STILL emits tombstone to dedup!)
-                        bool valid = (fl[1].n > 0 && fl[5].n > 0);
-                        i64 ts = INVALID_TS;
                         u8 is_purch = 0;
                         u32 price = 0;
                         u16 cat = 0;
-
-                        if (__builtin_expect(valid, 1)) {
-                            ts = ftime.parse(fl[2].p, fl[2].n);
-                            valid = (ts >= window_start && ts < window_end && (ing_ms - ts) <= DAY_MS);
-                        }
                         if (__builtin_expect(valid, 1)) {
                             const u8* tp = fl[4].p;
                             u32 tn = fl[4].n;
@@ -620,9 +707,7 @@ struct Pipeline {
                                 if (w8 == 0x6573616863727570ULL /*"purchase"*/) {
                                     is_purch = 1;
                                     valid = parse_price_cents(fl[6].p, fl[6].n, price);
-                                    if (valid) {
-                                        cat = cats.lookup_product(fl[5].p, fl[5].n);
-                                    }
+                                    if (valid) cat = cats.lookup_product(fl[5].p, fl[5].n);
                                 } else {
                                     valid = false;
                                 }
@@ -632,7 +717,6 @@ struct Pipeline {
                         }
 
                         if (__builtin_expect(!valid, 0)) {
-                            // Emit invalid tombstone into dedup so earlier invalid copy poisons later valid copies!
                             if (eid_dom == DOM_SHORT) {
                                 u32 q = u32(wyhash64(eid_lo) >> 32) & (DS - 1u);
                                 w.emit_short_e(q, {eid_lo, u32(ing_diff), INVALID_LOC});
@@ -664,7 +748,6 @@ struct Pipeline {
                         }
                     });
                 } else {
-                    // Clicks CSV: click_id,user_id,campaign_id,ts
                     const u32 fshift = tk.file << 20;
                     scan_csv<4>(mf.data, s, e, [&](const Field fl[4]) {
                         if (__builtin_expect(fl[0].n == 0 || fl[1].n == 0, 0)) return;
@@ -690,6 +773,7 @@ struct Pipeline {
             }
             flush_events(w, ev_buf, nev);
             flush_clicks(w, ck_buf, nck);
+            w.flush_all_stages();
         });
     }
 
@@ -792,7 +876,6 @@ struct Pipeline {
             }
         });
 
-        // Deduplicate tiny exotic_erecs (typically 0 on generator data, small on fixtures)
         size_t total_ex = 0;
         for (int t = 0; t < nt; ++t) total_ex += workers[t].exotic_erecs.size();
         if (total_ex > 0) {
@@ -817,8 +900,8 @@ struct Pipeline {
     }
 
     // ------------------------------------------------------------------------
-    // Phase 3: Parallel Person Partitions -> Sort-Free 30-Min Binning ->
-    //          O(S+C) Sliding-Window Attribution & Assists -> Parallel Parquet Write
+    // Phase 3: Single-Hash L1 Grouping + Sort-Free 30-Min Binning +
+    //          O(S+C) Sliding-Window Attribution & Assists + Parallel Parquet Write
     // ------------------------------------------------------------------------
     struct LocalClick {
         u32 ts;
@@ -846,28 +929,39 @@ struct Pipeline {
         const u32 ncats = u32(cats.categories.size());
         const bool use_binning = (num_bins > 0 && num_bins <= 1024);
         const u32 nbin_words = (num_bins + 63u) >> 6;
+        const u32 wsm = ws_mod;
 
         std::atomic<u32> next_p{0};
 
         pool.run([&](int tid) {
             Worker& w = workers[tid];
-            w.ud_cols.reserve(600000, 100000);
+            w.ud_cols.reserve(350000, 100000);
 
-            // Thread-local grouping & sessionization scratch
-            struct LSlot {
+            // Compact 16-byte L1-resident Short local table!
+            struct ShortLSlot {
+                u64 key; // 0 = empty
+                u32 pid;
+                u32 pad;
+            };
+            struct OtherLSlot {
                 UserKey key;
                 u32 pid;
                 u8 used;
             };
-            std::vector<LSlot> ltab;
+            std::vector<ShortLSlot> stab;
+            std::vector<OtherLSlot> otab;
             std::vector<UserKey> lkeys;
             std::vector<u32> ev_cnt, pu_cnt, ck_cnt;
             std::vector<u32> ev_off, pu_off, ck_off;
-            std::vector<u32> ev_ts;
-            std::vector<LocalPurch> pu_arr;
-            std::vector<LocalClick> ck_arr;
 
-            // Zero-sort 30-minute bins (<= 1024 bins = 16 KB, fits in L1!)
+            // Single-hash pass buffers: cache (pid, ts) so we NEVER hash events twice!
+            std::vector<u32> tmp_pid, tmp_ts;
+            std::vector<u32> ev_ts;
+            std::vector<u32> tmp_pu_pid;
+            std::vector<LocalPurch> tmp_pu, pu_arr;
+            std::vector<u32> tmp_ck_pid;
+            std::vector<LocalClick> tmp_ck, ck_arr;
+
             std::vector<Bin> bins(use_binning ? num_bins : 1, Bin{0xFFFFFFFFu, 0, 0, 0});
             std::vector<u64> bmap(use_binning ? nbin_words : 1, 0);
 
@@ -877,7 +971,6 @@ struct Pipeline {
             std::vector<u8>  s_has_p;
             std::vector<u64> catday(size_t(num_days) * size_t(ncats), 0);
 
-            // Sliding window campaign state
             std::vector<u32> ccnt(ncamp, 0);
             std::vector<u32> cact(ncamp, 0);
 
@@ -906,108 +999,179 @@ struct Pipeline {
                 u32 p = next_p.fetch_add(1, std::memory_order_relaxed);
                 if (p >= P) break;
 
-                // Estimate events in partition p
-                u32 est_ev = 0, est_pu = 0, est_ck = 0;
+                u32 est_sp = 0, est_lp = 0, est_ep = 0, est_pu = 0, est_ck = 0;
                 for (int t = 0; t < nt; ++t) {
-                    est_ev += workers[t].sp_parts[p].total +
-                              workers[t].lp_parts[p].total +
-                              workers[t].ep_parts[p].total;
+                    est_sp += workers[t].sp_parts[p].total;
+                    est_lp += workers[t].lp_parts[p].total;
+                    est_ep += workers[t].ep_parts[p].total;
                     est_pu += workers[t].pu_parts[p].total;
                     est_ck += workers[t].ck_parts[p].total;
                 }
+                u32 est_ev = est_sp + est_lp + est_ep;
                 if (est_ev == 0) continue;
 
-                // Size local person hash table (avg ~30 events/person -> est_ev/8 slots is plenty)
-                u32 lcap = 128;
-                u32 want = std::max<u32>(est_ev / 4u + 64u, 64u);
-                while (lcap < want) lcap <<= 1;
-                if (ltab.size() < lcap) ltab.resize(lcap);
-                for (u32 i = 0; i < lcap; ++i) ltab[i].used = 0;
-                u32 lmask = lcap - 1u;
+                // Size compact Short local hash table (16 B/slot -> 32-64 KB, fits in L1/L2!)
+                u32 scap = 128;
+                u32 swant = std::max<u32>(est_sp / 6u + 64u, 64u);
+                while (scap < swant) scap <<= 1;
+                if (stab.size() < scap) stab.resize(scap);
+                std::memset(stab.data(), 0, size_t(scap) * sizeof(ShortLSlot));
+                u32 smask = scap - 1u;
+                u32 s_used = 0;
+
+                // Tiny Other local hash table (for DOM_HEX32 + DOM_EXOTIC)
+                u32 ocap = 64;
+                u32 owant = std::max<u32>((est_lp + est_ep) / 6u + 32u, 32u);
+                while (ocap < owant) ocap <<= 1;
+                if (otab.size() < ocap) otab.resize(ocap);
+                for (u32 i = 0; i < ocap; ++i) otab[i].used = 0;
+                u32 omask = ocap - 1u;
+                u32 o_used = 0;
 
                 lkeys.clear();
                 ev_cnt.clear();
+                tmp_pid.clear();
+                tmp_ts.clear();
+                if (tmp_pid.capacity() < est_ev) {
+                    tmp_pid.reserve(est_ev);
+                    tmp_ts.reserve(est_ev);
+                }
 
-                auto grow_ltab = [&]() {
-                    u32 ncap = lcap << 1;
-                    std::vector<LSlot> ntab(ncap);
-                    for (u32 i = 0; i < ncap; ++i) ntab[i].used = 0;
+                auto grow_stab = [&]() {
+                    u32 ncap = scap << 1;
+                    std::vector<ShortLSlot> ntab(ncap, ShortLSlot{0, 0, 0});
                     u32 nmask = ncap - 1u;
-                    for (u32 i = 0; i < lcap; ++i) {
-                        if (!ltab[i].used) continue;
-                        u32 idx = u32(hash_user_key(ltab[i].key)) & nmask;
-                        while (ntab[idx].used) idx = (idx + 1u) & nmask;
-                        ntab[idx] = ltab[i];
+                    for (u32 i = 0; i < scap; ++i) {
+                        if (stab[i].key == 0) continue;
+                        u32 idx = u32(hash_short(stab[i].key)) & nmask;
+                        while (ntab[idx].key != 0) idx = (idx + 1u) & nmask;
+                        ntab[idx] = stab[i];
                     }
-                    ltab.swap(ntab);
-                    lcap = ncap;
-                    lmask = nmask;
+                    stab.swap(ntab);
+                    scap = ncap;
+                    smask = nmask;
                 };
 
-                auto get_or_add_local = [&](const UserKey& k) -> u32 {
-                    if (__builtin_expect(lkeys.size() * 2 >= lcap, 0)) grow_ltab();
-                    u32 idx = u32(hash_user_key(k)) & lmask;
+                auto grow_otab = [&]() {
+                    u32 ncap = ocap << 1;
+                    std::vector<OtherLSlot> ntab(ncap);
+                    for (u32 i = 0; i < ncap; ++i) ntab[i].used = 0;
+                    u32 nmask = ncap - 1u;
+                    for (u32 i = 0; i < ocap; ++i) {
+                        if (!otab[i].used) continue;
+                        u32 idx = u32(hash_user_key(otab[i].key)) & nmask;
+                        while (ntab[idx].used) idx = (idx + 1u) & nmask;
+                        ntab[idx] = otab[i];
+                    }
+                    otab.swap(ntab);
+                    ocap = ncap;
+                    omask = nmask;
+                };
+
+                auto get_or_add_short = [&](u64 key) -> u32 {
+                    if (__builtin_expect(s_used * 2 >= scap, 0)) grow_stab();
+                    u32 idx = u32(hash_short(key)) & smask;
                     for (;;) {
-                        LSlot& s = ltab[idx];
+                        ShortLSlot& s = stab[idx];
+                        if (s.key == key) return s.pid;
+                        if (s.key == 0) {
+                            u32 pid = u32(lkeys.size());
+                            s.key = key;
+                            s.pid = pid;
+                            s_used++;
+                            lkeys.push_back({key, 0, DOM_SHORT});
+                            ev_cnt.push_back(0);
+                            return pid;
+                        }
+                        idx = (idx + 1u) & smask;
+                    }
+                };
+
+                auto get_or_add_other = [&](const UserKey& k) -> u32 {
+                    if (__builtin_expect(o_used * 2 >= ocap, 0)) grow_otab();
+                    u32 idx = u32(hash_user_key(k)) & omask;
+                    for (;;) {
+                        OtherLSlot& s = otab[idx];
                         if (!s.used) {
                             u32 pid = u32(lkeys.size());
                             s.key = k;
                             s.pid = pid;
                             s.used = 1;
+                            o_used++;
                             lkeys.push_back(k);
                             ev_cnt.push_back(0);
                             return pid;
                         }
                         if (s.key == k) return s.pid;
-                        idx = (idx + 1u) & lmask;
+                        idx = (idx + 1u) & omask;
                     }
                 };
 
-                auto find_local = [&](const UserKey& k) -> i32 {
-                    u32 idx = u32(hash_user_key(k)) & lmask;
+                auto find_any = [&](u64 lo, u64 hi, u8 dom) -> i32 {
+                    if (__builtin_expect(dom == DOM_SHORT, 1)) {
+                        u32 idx = u32(hash_short(lo)) & smask;
+                        for (;;) {
+                            const ShortLSlot& s = stab[idx];
+                            if (s.key == 0) return -1;
+                            if (s.key == lo) return i32(s.pid);
+                            idx = (idx + 1u) & smask;
+                        }
+                    }
+                    UserKey k{lo, hi, dom};
+                    u32 idx = u32(hash_user_key(k)) & omask;
                     for (;;) {
-                        const LSlot& s = ltab[idx];
+                        const OtherLSlot& s = otab[idx];
                         if (!s.used) return -1;
                         if (s.key == k) return i32(s.pid);
-                        idx = (idx + 1u) & lmask;
+                        idx = (idx + 1u) & omask;
                     }
                 };
 
-                // Pass 1: Count surviving events per local person
-                u32 total_live_ev = 0;
+                // SINGLE HASH PASS over all surviving events!
                 for (int t = 0; t < nt; ++t) {
                     for (ShortPBlock* b = workers[t].sp_parts[p].head; b; b = b->next) {
-                        const u32 bn = b->n;
-                        for (u32 i = 0; i < bn; ++i) {
-                            if (__builtin_expect(b->ts[i] == DEAD_TS, 0)) continue;
-                            u32 pid = get_or_add_local({b->ukey[i], 0, DOM_SHORT});
-                            ev_cnt[pid]++;
-                            total_live_ev++;
+                        const u32 ng = b->ngroups;
+                        for (u32 g = 0; g < ng; ++g) {
+                            const ShortPGroup5& gr = b->g[g];
+                            const u32 gc = gr.count;
+                            for (u32 i = 0; i < gc; ++i) {
+                                u32 ts = gr.ts[i];
+                                if (__builtin_expect(ts == DEAD_TS, 0)) continue;
+                                u32 pid = get_or_add_short(gr.ukey[i]);
+                                ev_cnt[pid]++;
+                                tmp_pid.push_back(pid);
+                                tmp_ts.push_back(ts);
+                            }
                         }
                     }
                     for (LongPBlock* b = workers[t].lp_parts[p].head; b; b = b->next) {
                         const u32 bn = b->n;
                         for (u32 i = 0; i < bn; ++i) {
-                            if (__builtin_expect(b->ts[i] == DEAD_TS, 0)) continue;
-                            u32 pid = get_or_add_local({b->lo[i], b->hi[i], DOM_HEX32});
+                            u32 ts = b->r[i].ts;
+                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
+                            u32 pid = get_or_add_other({b->r[i].lo, b->r[i].hi, DOM_HEX32});
                             ev_cnt[pid]++;
-                            total_live_ev++;
+                            tmp_pid.push_back(pid);
+                            tmp_ts.push_back(ts);
                         }
                     }
                     for (ExoticPBlock* b = workers[t].ep_parts[p].head; b; b = b->next) {
                         const u32 bn = b->n;
                         for (u32 i = 0; i < bn; ++i) {
-                            if (__builtin_expect(b->ts[i] == DEAD_TS, 0)) continue;
-                            u32 pid = get_or_add_local({b->eid[i], 0, DOM_EXOTIC});
+                            u32 ts = b->r[i].ts;
+                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
+                            u32 pid = get_or_add_other({b->r[i].eid, 0, DOM_EXOTIC});
                             ev_cnt[pid]++;
-                            total_live_ev++;
+                            tmp_pid.push_back(pid);
+                            tmp_ts.push_back(ts);
                         }
                     }
                 }
                 const u32 np = u32(lkeys.size());
                 if (np == 0) continue;
 
-                // Prefix sum for events
+                // Zero-hashing counting scatter of events!
+                const u32 total_live_ev = u32(tmp_pid.size());
                 ev_off.resize(np + 1);
                 {
                     u32 run = 0;
@@ -1015,42 +1179,19 @@ struct Pipeline {
                     ev_off[np] = run;
                 }
                 if (ev_ts.size() < total_live_ev) ev_ts.resize(total_live_ev);
-                // Use ev_cnt as write cursor (restore from ev_off[i+1]-ev_off[i])
                 std::memcpy(ev_cnt.data(), ev_off.data(), np * sizeof(u32));
-
-                for (int t = 0; t < nt; ++t) {
-                    for (ShortPBlock* b = workers[t].sp_parts[p].head; b; b = b->next) {
-                        const u32 bn = b->n;
-                        for (u32 i = 0; i < bn; ++i) {
-                            u32 ts = b->ts[i];
-                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
-                            i32 pid = find_local({b->ukey[i], 0, DOM_SHORT});
-                            ev_ts[ev_cnt[pid]++] = ts;
-                        }
-                    }
-                    for (LongPBlock* b = workers[t].lp_parts[p].head; b; b = b->next) {
-                        const u32 bn = b->n;
-                        for (u32 i = 0; i < bn; ++i) {
-                            u32 ts = b->ts[i];
-                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
-                            i32 pid = find_local({b->lo[i], b->hi[i], DOM_HEX32});
-                            ev_ts[ev_cnt[pid]++] = ts;
-                        }
-                    }
-                    for (ExoticPBlock* b = workers[t].ep_parts[p].head; b; b = b->next) {
-                        const u32 bn = b->n;
-                        for (u32 i = 0; i < bn; ++i) {
-                            u32 ts = b->ts[i];
-                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
-                            i32 pid = find_local({b->eid[i], 0, DOM_EXOTIC});
-                            ev_ts[ev_cnt[pid]++] = ts;
-                        }
-                    }
+                const u32* tp_ptr = tmp_pid.data();
+                const u32* tt_ptr = tmp_ts.data();
+                u32* ec_ptr = ev_cnt.data();
+                u32* et_ptr = ev_ts.data();
+                for (u32 i = 0; i < total_live_ev; ++i) {
+                    et_ptr[ec_ptr[tp_ptr[i]]++] = tt_ptr[i];
                 }
 
-                // Purchases: count & scatter ONLY live purchases (skipping killed PRecs!)
+                // Single-hash pass for live purchases
                 pu_cnt.assign(np, 0);
-                u32 total_live_pu = 0;
+                tmp_pu_pid.clear();
+                tmp_pu.clear();
                 if (est_pu > 0) {
                     for (int t = 0; t < nt; ++t) {
                         for (PurchBlock* b = workers[t].pu_parts[p].head; b; b = b->next) {
@@ -1058,10 +1199,11 @@ struct Pipeline {
                             for (u32 i = 0; i < bn; ++i) {
                                 const PurchRec& pr = b->r[i];
                                 if (__builtin_expect(is_loc_dead(pr.ploc), 0)) continue;
-                                i32 pid = find_local({pr.u_lo, pr.u_hi, pr.u_dom});
+                                i32 pid = find_any(pr.u_lo, pr.u_hi, pr.u_dom);
                                 if (pid >= 0) {
                                     pu_cnt[pid]++;
-                                    total_live_pu++;
+                                    tmp_pu_pid.push_back(u32(pid));
+                                    tmp_pu.push_back({pr.ts, pr.price, pr.cat});
                                 }
                             }
                         }
@@ -1073,37 +1215,30 @@ struct Pipeline {
                     for (u32 i = 0; i < np; ++i) { pu_off[i] = run; run += pu_cnt[i]; }
                     pu_off[np] = run;
                 }
+                const u32 total_live_pu = u32(tmp_pu.size());
                 if (total_live_pu > 0) {
                     if (pu_arr.size() < total_live_pu) pu_arr.resize(total_live_pu);
                     std::memcpy(pu_cnt.data(), pu_off.data(), np * sizeof(u32));
-                    for (int t = 0; t < nt; ++t) {
-                        for (PurchBlock* b = workers[t].pu_parts[p].head; b; b = b->next) {
-                            const u32 bn = b->n;
-                            for (u32 i = 0; i < bn; ++i) {
-                                const PurchRec& pr = b->r[i];
-                                if (__builtin_expect(is_loc_dead(pr.ploc), 0)) continue;
-                                i32 pid = find_local({pr.u_lo, pr.u_hi, pr.u_dom});
-                                if (pid >= 0) {
-                                    pu_arr[pu_cnt[pid]++] = {pr.ts, pr.price, pr.cat};
-                                }
-                            }
-                        }
+                    for (u32 i = 0; i < total_live_pu; ++i) {
+                        pu_arr[pu_cnt[tmp_pu_pid[i]]++] = tmp_pu[i];
                     }
                 }
 
-                // Clicks: count & scatter ONLY clicks belonging to people with >= 1 live event!
+                // Single-hash pass for live clicks
                 ck_cnt.assign(np, 0);
-                u32 total_live_ck = 0;
+                tmp_ck_pid.clear();
+                tmp_ck.clear();
                 if (est_ck > 0) {
                     for (int t = 0; t < nt; ++t) {
                         for (ClickBlock* b = workers[t].ck_parts[p].head; b; b = b->next) {
                             const u32 bn = b->n;
                             for (u32 i = 0; i < bn; ++i) {
                                 const ClickRec& cr = b->r[i];
-                                i32 pid = find_local({cr.u_lo, cr.u_hi, u8(cr.camp_dom >> 30)});
+                                i32 pid = find_any(cr.u_lo, cr.u_hi, u8(cr.camp_dom >> 30));
                                 if (pid >= 0) {
                                     ck_cnt[pid]++;
-                                    total_live_ck++;
+                                    tmp_ck_pid.push_back(u32(pid));
+                                    tmp_ck.push_back({cr.ts, cr.camp_dom & 0x3FFFFFFFu, cr.file_len, cr.cid_off});
                                 }
                             }
                         }
@@ -1115,24 +1250,16 @@ struct Pipeline {
                     for (u32 i = 0; i < np; ++i) { ck_off[i] = run; run += ck_cnt[i]; }
                     ck_off[np] = run;
                 }
+                const u32 total_live_ck = u32(tmp_ck.size());
                 if (total_live_ck > 0) {
                     if (ck_arr.size() < total_live_ck) ck_arr.resize(total_live_ck);
                     std::memcpy(ck_cnt.data(), ck_off.data(), np * sizeof(u32));
-                    for (int t = 0; t < nt; ++t) {
-                        for (ClickBlock* b = workers[t].ck_parts[p].head; b; b = b->next) {
-                            const u32 bn = b->n;
-                            for (u32 i = 0; i < bn; ++i) {
-                                const ClickRec& cr = b->r[i];
-                                i32 pid = find_local({cr.u_lo, cr.u_hi, u8(cr.camp_dom >> 30)});
-                                if (pid >= 0) {
-                                    ck_arr[ck_cnt[pid]++] = {cr.ts, cr.camp_dom & 0x3FFFFFFFu, cr.file_len, cr.cid_off};
-                                }
-                            }
-                        }
+                    for (u32 i = 0; i < total_live_ck; ++i) {
+                        ck_arr[ck_cnt[tmp_ck_pid[i]]++] = tmp_ck[i];
                     }
                 }
 
-                // Process each person in this partition!
+                // Process each person
                 for (u32 pid = 0; pid < np; ++pid) {
                     u32 e0 = ev_off[pid], e1 = ev_off[pid + 1];
                     u32 ne = e1 - e0;
@@ -1149,7 +1276,6 @@ struct Pipeline {
                     s_has_p.clear();
 
                     if (__builtin_expect(use_binning, 1)) {
-                        // ZERO-SORT 30-MINUTE BITMASK SESSIONIZATION!
                         const u32* ts = ev_ts.data() + e0;
                         Bin* B = bins.data();
                         u64* BM = bmap.data();
@@ -1172,7 +1298,7 @@ struct Pipeline {
                                 Bin& e = B[b];
                                 if (ns == 0 || (e.mn - prev_mx) > u32(SESSION_GAP_MS)) {
                                     s_start.push_back(e.mn);
-                                    s_day.push_back(u16(floor_div_day(window_start + i64(e.mn)) - base_day));
+                                    s_day.push_back(u16((e.mn + wsm) / u32(DAY_MS)));
                                     s_nev.push_back(0);
                                     s_rev.push_back(0);
                                     s_has_p.push_back(0);
@@ -1184,7 +1310,6 @@ struct Pipeline {
                             }
                         }
 
-                        // Map purchases directly to their session in O(1)!
                         if (nu > 0) {
                             const LocalPurch* pu = pu_arr.data() + u0;
                             for (u32 i = 0; i < nu; ++i) {
@@ -1195,7 +1320,6 @@ struct Pipeline {
                             }
                         }
 
-                        // Clear ONLY occupied bins!
                         for (u32 wi = 0; wi < nbin_words; ++wi) {
                             u64 m = BM[wi];
                             if (!m) continue;
@@ -1207,7 +1331,6 @@ struct Pipeline {
                             }
                         }
                     } else {
-                        // Exact sort fallback for windows > 21 days
                         u32* ts = ev_ts.data() + e0;
                         std::sort(ts, ts + ne);
                         u32 prev = 0;
@@ -1227,7 +1350,6 @@ struct Pipeline {
                         if (nu > 0) {
                             const LocalPurch* pu = pu_arr.data() + u0;
                             for (u32 i = 0; i < nu; ++i) {
-                                // Upper bound on s_start gives session index
                                 auto it = std::upper_bound(s_start.begin(), s_start.end(), pu[i].ts);
                                 u32 sid = u32((it - s_start.begin()) - 1);
                                 s_rev[sid] += pu[i].price;
@@ -1237,7 +1359,6 @@ struct Pipeline {
                         }
                     }
 
-                    // Emit user_daily rows for this person (contiguous by person for RLE_DICTIONARY!)
                     u32 active_days = 0;
                     for (u32 i = 0; i < ns;) {
                         u16 d = s_day[i];
@@ -1271,14 +1392,12 @@ struct Pipeline {
                         }
                     }
 
-                    // Decode person name ONCE for all active_days of this person!
                     u8 name_buf[33];
                     std::string_view sv = decode_user_key(lkeys[pid], name_buf, user_exotic);
                     w.ud_cols.add_person_name(reinterpret_cast<const u8*>(sv.data()), u32(sv.size()), active_days);
 
                     if (nc == 0) continue;
 
-                    // Sort person's clicks by ts; break same-ms multi-campaign ties to smallest click_id LAST!
                     LocalClick* ck = ck_arr.data() + c0;
                     if (nc <= 24) {
                         for (u32 a = 1; a < nc; ++a) {
@@ -1312,10 +1431,9 @@ struct Pipeline {
                         a = b;
                     }
 
-                    // O(ns + nc) Two-Pointer Sliding-Window Attribution & Assists!
                     u32 lo = 0, hi = 0;
                     for (u32 s = 0; s < ns; ++s) {
-                        u32 st = s_start[s] + u32(WEEK_MS); // convert to click-relative ms
+                        u32 st = s_start[s] + u32(WEEK_MS);
                         while (hi < nc && ck[hi].ts <= st) {
                             u32 c = ck[hi].camp;
                             if (ccnt[c]++ == 0) cact[c] = s;
@@ -1340,14 +1458,12 @@ struct Pipeline {
                 }
             }
 
-            // Write this worker's user_daily Parquet file in parallel!
             if (!w.ud_cols.day.empty()) {
                 std::string path = out_dir + "/user_daily/part-" + std::to_string(tid) + ".parquet";
                 w.ud_cols.write_parquet(path, cats.categories);
             }
         });
 
-        // If ALL workers had 0 rows (empty dataset fixture!), thread 0 writes valid empty Parquet
         bool any_ud = false;
         for (int t = 0; t < nt; ++t) {
             if (!workers[t].ud_cols.day.empty()) { any_ud = true; break; }
@@ -1406,15 +1522,14 @@ struct Pipeline {
         if (ncpu < 1) ncpu = 1;
         if (ncpu > 16) ncpu = 16;
 
-        // Create output directories
         ::mkdir(out_dir.c_str(), 0777);
         ::mkdir((out_dir + "/user_daily").c_str(), 0777);
         ::mkdir((out_dir + "/campaign_daily").c_str(), 0777);
 
-        // Phase 0: Load manifest, open input files, load catalogs & links
         load_manifest(data_dir + "/manifest.json", window_start, window_end);
         click_start = window_start - WEEK_MS;
         base_day = floor_div_day(window_start);
+        ws_mod = u32(window_start - base_day * DAY_MS);
         i64 end_day = (window_end > window_start) ? floor_div_day(window_end - 1) : base_day;
         num_days = u32(std::max<i64>(1, end_day - base_day + 1));
         ing_origin_sec = window_start / 1000LL - 30LL * 86400LL;
@@ -1444,57 +1559,44 @@ struct Pipeline {
             click_files[i].close_fd();
         }
 
-        // Adaptive partition sizing for L2-cache residency from 1K fixtures up to 60M+ final!
+        // L1/L2 cache-tuned partition counts
         if (total_ev_bytes < (16u << 20)) {
             P = 64; DS = 64; DL = 32;
         } else if (total_ev_bytes < (256u << 20)) {
             P = 256; DS = 256; DL = 64;
         } else if (total_ev_bytes < (3000ULL << 20)) {
-            // ~20M practice (~1.7 GB CSV)
-            P = 1024; DS = 2048; DL = 256;
+            // ~20M practice (~1.7 GB CSV): P=512 (32KB L1 stage), DS=1024 (64KB L2 stage)
+            P = 512; DS = 1024; DL = 256;
         } else {
-            // ~60M final (~5.5 GB CSV)
-            P = 2048; DS = 4096; DL = 512;
+            // ~60M final (~5.5 GB CSV): P=1024 (64KB stage), DS=2048 (128KB stage)
+            P = 1024; DS = 2048; DL = 512;
         }
 
-        // For tiny fixtures, use 1 thread to avoid thread startup overhead
         int eff_ncpu = (total_ev_bytes < (256u << 10)) ? 1 : ncpu;
         ThreadPool pool(eff_ncpu);
         prof.mark("open+init");
 
-        // Load products & campaigns (tiny: < 1 ms)
-        cats.load_products(data_dir + "/products.csv");
-        cats.load_campaigns(data_dir + "/campaigns.csv");
-        prof.mark("catalogs");
+        // Overlapped catalogs + parallel lock-free links DSU + Bloom + 16B Alias Table!
+        links.build_with_catalogs(link_files, cats, data_dir, pool, user_exotic);
+        prof.mark("cat+links+bloom");
 
-        // Build links DSU + Blocked Bloom + Non-Canonical Alias Table
-        links.build(link_files, pool, user_exotic);
-        prof.mark("links+bloom");
-
-        // Initialize per-worker state
         workers.resize(eff_ncpu);
         for (int t = 0; t < eff_ncpu; ++t) {
             workers[t].init(t, P, DS, DL, cats.num_campaigns + 1u, num_days);
         }
 
-        // Phase 1: Parse events & clicks (single scatter directly to person partitions!)
         parse_events_and_clicks(pool);
         prof.mark("parse+scatter");
 
-        // Phase 2: L2-resident exact dedup (kills ~3% losing copies in place!)
         dedup_phase(pool);
         prof.mark("dedup");
 
-        // Phase 3: Sort-free 30-min sessionization + O(S+C) attribution/assists + parallel user_daily Parquet!
         sessions_and_write(pool);
         prof.mark("sessions+user_pq");
 
-        // Phase 4: Merge campaign_daily & write Parquet
         write_campaign_daily();
         prof.mark("campaign_pq");
 
-        // Fast clean exit: skip C++ destructors & single-threaded munmap storms!
-        // Optional parallel MADV_DONTNEED to offload kernel PTE teardown across cores.
         if (eff_ncpu > 1 && total_ev_bytes > (256u << 20)) {
             u32 nreg = std::min<u32>(g_regions.count.load(std::memory_order_relaxed), 4096u);
             std::atomic<u32> ri{0};
