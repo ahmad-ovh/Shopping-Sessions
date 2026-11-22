@@ -221,19 +221,38 @@ struct HugeBuf {
     inline void clear() { len = 0; }
 };
 
-// Bump-pointer block allocator backed by a single large MAP_NORESERVE huge-page virtual region
+// Bump-pointer block allocator backed by MAP_NORESERVE huge-page virtual regions
+// Supports rewind() to recycle already-faulted 2 MiB THP pages across disjoint pipeline phases!
 struct SlabArena {
     u8* cur = nullptr;
     u8* end = nullptr;
-    size_t reserve_bytes = 512ULL << 20;
+    u8* first_cur = nullptr;
+    u8* first_end = nullptr;
+    size_t reserve_bytes = 48ULL << 20;
+
+    void set_chunk_size(size_t bytes) {
+        reserve_bytes = (bytes + (2u << 20) - 1) & ~size_t((2u << 20) - 1);
+        if (reserve_bytes < (2u << 20)) reserve_bytes = 2u << 20;
+    }
+
+    void rewind() {
+        if (first_cur) {
+            cur = first_cur;
+            end = first_end;
+        }
+    }
 
     void* alloc(size_t bytes, size_t align = 64) {
         uintptr_t p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
         if (__builtin_expect(p + bytes > uintptr_t(end), 0)) {
             size_t need = bytes + align;
-            size_t sz = need > reserve_bytes ? ((need + (2u << 20) - 1) & ~((2u << 20) - 1)) : reserve_bytes;
+            size_t sz = need > reserve_bytes ? ((need + (2u << 20) - 1) & ~size_t((2u << 20) - 1)) : reserve_bytes;
             cur = static_cast<u8*>(huge_alloc(sz));
             end = cur + sz;
+            if (!first_cur) {
+                first_cur = cur;
+                first_end = end;
+            }
             p = (uintptr_t(cur) + align - 1) & ~(uintptr_t(align) - 1);
         }
         cur = reinterpret_cast<u8*>(p + bytes);

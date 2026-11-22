@@ -428,7 +428,28 @@ struct UserDailyCols {
 
     HugeBuf<u16> cat_idx;
 
-    void reserve(size_t est_rows, size_t est_people) {
+    void reserve(size_t est_rows, size_t est_people, SlabArena* arena = nullptr) {
+        if (arena) {
+            size_t db_cap = std::max<size_t>(est_people * 20, 4096);
+            size_t rl_cap = std::max<size_t>(est_people, 1024);
+            size_t ci_cap = std::max<size_t>(est_rows / 4 + 1024, 1024);
+            user_dict_bytes.ptr = static_cast<u8*>(arena->alloc(db_cap, 64));
+            user_dict_bytes.cap = db_cap;
+            user_dict_bytes.len = 0;
+            user_run_lens.ptr = static_cast<u32*>(arena->alloc(rl_cap * sizeof(u32), 64));
+            user_run_lens.cap = rl_cap;
+            user_run_lens.len = 0;
+            cat_idx.ptr = static_cast<u16*>(arena->alloc(ci_cap * sizeof(u16), 64));
+            cat_idx.cap = ci_cap;
+            cat_idx.len = 0;
+            rcap = est_rows < 4096 ? 4096 : est_rows;
+            day      = static_cast<i32*>(arena->alloc(rcap * sizeof(i32), 64));
+            sessions = static_cast<i32*>(arena->alloc(rcap * sizeof(i32), 64));
+            events   = static_cast<i32*>(arena->alloc(rcap * sizeof(i32), 64));
+            rev32    = static_cast<i32*>(arena->alloc(rcap * sizeof(i32), 64));
+            cat_def  = static_cast<u8*>(arena->alloc(rcap * sizeof(u8), 64));
+            return;
+        }
         user_dict_bytes.init_reserve(est_people * 20);
         user_run_lens.init_reserve(est_people);
         cat_idx.init_reserve(est_rows / 4 + 1024);

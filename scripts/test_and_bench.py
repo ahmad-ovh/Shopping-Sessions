@@ -43,9 +43,14 @@ def docker_run_bind(image: str, data_dir: Path, out_dir: Path, cpus="8", mem="14
         for k, v in extra_env.items():
             cmd += ["-e", f"{k}={v}"]
     cmd.append(image)
-    t0 = time.perf_counter()
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return p, time.perf_counter() - t0
+    for attempt in range(3):
+        t0 = time.perf_counter()
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        dt = time.perf_counter() - t0
+        if p.returncode != 125:
+            break
+        time.sleep(2)
+    return p, dt
 
 
 def run_fixtures(image: str):

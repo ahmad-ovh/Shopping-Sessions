@@ -75,7 +75,7 @@ static inline u64 swar8_to_u64(u64 v) {
 static inline i64 parse_f3_13(const u8* p) {
     u64 a = load64u(p);
     u64 b = load64u(p + 5);
-    if (__builtin_expect(all_digits8(a) & all_digits8(b), 1)) {
+    if (__builtin_expect((int(all_digits8(a)) & int(all_digits8(b))) != 0, 1)) {
         u64 b5 = (b & 0xFFFFFFFFFF000000ULL) | 0x0000000000303030ULL;
         return i64(swar8_to_u64(a) * 100000ULL + swar8_to_u64(b5));
     }
@@ -165,7 +165,6 @@ struct FastTime {
     inline bool parse_dt19_sec(const u8* s, i64& secs) const {
         const u64 a = load64u(s);
         const u64 b = load64u(s + 8);
-        const u64 c = load64u(s + 16);
 
         constexpr u64 SB = 0x0000FF0000FF0000ULL;
         constexpr u64 VB = (u64('T') << 16) | (u64(':') << 40);
@@ -177,22 +176,20 @@ struct FastTime {
 
         // Hot path: "YYYY-MM-" matches precomputed window month (skips YYYY, MM, '-', '-' & mstart LUT!)
         if (__builtin_expect(a == ym0_ascii || a == ym1_ascii, 1)) {
-            if (__builtin_expect((((b & SB) ^ VB) | ((c & 0xFFu) ^ u64(':'))) != 0, 0))
+            if (__builtin_expect((((b & SB) ^ VB) | (u64(s[16]) ^ u64(':'))) != 0, 0))
                 return false;
             const u64 tb = (b ^ Z) & DB;
-            const u64 tc = (c ^ Z) & DC;
-            if (__builtin_expect((((tb | (tb + SIX)) & HI & DB) |
-                                  ((tc | (tc + SIX)) & HI & DC)) != 0, 0))
+            const u32 s1 = u32(s[17] - '0'), s2 = u32(s[18] - '0');
+            if (__builtin_expect((((tb | (tb + SIX)) & HI & DB) != 0) | (s1 > 5u) | (s2 > 9u), 0))
                 return false;
             const u64 pb = tb * 10ULL + (tb >> 8);
-            const u64 pc = tc * 10ULL + (tc >> 8);
             const u32 dd = u32(pb & 0xFFu);
             const u32 hh = u32((pb >> 24) & 0xFFu);
             const u32 mi = u32((pb >> 48) & 0xFFu);
-            const u32 ss = u32((pc >> 8) & 0xFFu);
+            const u32 ss = s1 * 10u + s2;
             const bool is0 = (a == ym0_ascii);
             const u32 dim = is0 ? ym0_dim : ym1_dim;
-            if (__builtin_expect((dd == 0u) | (dd > dim) | (hh > 23u) | (mi > 59u) | (ss > 59u), 0))
+            if (__builtin_expect((dd == 0u) | (dd > dim) | (hh > 23u) | (mi > 59u), 0))
                 return false;
             const i64 base = is0 ? ym0_sec_base : ym1_sec_base;
             secs = base + i64(dd) * 86400LL + i64(hh * 3600u + mi * 60u + ss);
@@ -200,6 +197,7 @@ struct FastTime {
         }
 
         // General path: any year/month
+        const u64 c = load64u(s + 16);
         constexpr u64 SA = 0xFF0000FF00000000ULL;
         constexpr u64 VA = (u64('-') << 32) | (u64('-') << 56);
         constexpr u64 DA = 0x00FFFF00FFFFFFFFULL;
@@ -243,14 +241,12 @@ struct FastTime {
         if (__builtin_expect(n != 20 || s[19] != 'Z', 0)) return INVALID_TS;
         constexpr u64 Z = 0x3030303030303030ULL;
         const u64 a  = load64u(s);
-        const u64 tb = (load64u(s + 8)  ^ Z) & 0xFFFF00FFFF00FFFFULL;
-        const u64 tc = (load64u(s + 16) ^ Z) & 0x0000000000FFFF00ULL;
+        const u64 tb = (load64u(s + 8) ^ Z) & 0xFFFF00FFFF00FFFFULL;
         const u64 pb = tb * 10ULL + (tb >> 8);
-        const u64 pc = tc * 10ULL + (tc >> 8);
+        const u32 ss = u32(s[17] - '0') * 10u + u32(s[18] - '0');
         const i64 d_hms = i64(pb & 0xFFu) * 86400LL +
                           i64(((pb >> 24) & 0xFFu) * 3600u +
-                              ((pb >> 48) & 0xFFu) * 60u +
-                              ((pc >> 8) & 0xFFu));
+                              ((pb >> 48) & 0xFFu) * 60u + ss);
         if (__builtin_expect(a == ym0_ascii, 1)) return ym0_sec_base + d_hms;
         if (__builtin_expect(a == ym1_ascii, 1)) return ym1_sec_base + d_hms;
         const u64 ta = (a ^ Z) & 0x00FFFF00FFFFFFFFULL;

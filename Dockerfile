@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim AS build
+FROM debian:trixie-slim AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends g++ libc6-dev \
  && rm -rf /var/lib/apt/lists/*

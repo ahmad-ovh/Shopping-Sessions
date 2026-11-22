@@ -49,9 +49,10 @@ def main():
         ]
         rounds = 2
     else:
-        img_new = sys.argv[2] if len(sys.argv) > 2 else "hyperion:v5"
+        img_new = sys.argv[2] if len(sys.argv) > 2 else "hyperion:v6"
+        img_base = sys.argv[3] if len(sys.argv) > 3 else "hyperion:v5.2"
         configs = [
-            ("v4-baseline", "hyperion:v4", {"HYPERION_PROFILE": "1"}),
+            (img_base,      img_base,      {"HYPERION_PROFILE": "1"}),
             (img_new,       img_new,       {"HYPERION_PROFILE": "1"}),
             ("comp-mego74", "comp-mego74", {}),
         ]

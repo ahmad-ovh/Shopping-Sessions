@@ -30,7 +30,11 @@ def run_img_to_dir(img, vol_sub, out_dir: Path):
         "-e", "NCPU=8", "-e", "MEM_GB=14",
         img,
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    for attempt in range(3):
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 125:
+            break
+        import time; time.sleep(2)
     if p.returncode != 0:
         raise RuntimeError(f"{img} failed rc={p.returncode}: {p.stderr[-500:]}")
 

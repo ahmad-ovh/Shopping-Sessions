@@ -221,10 +221,14 @@ struct BlockList {
     u32 total = 0;
 };
 
-struct CampDayStat {
+// Hot 8-byte campaign-day counters (224 KB/thread at 2000 campaigns x 14 days -> fits in L2!)
+struct CampDayHot {
     u32 sessions = 0;
+    u32 assisted = 0;
+};
+// Cold 16-byte purchase counters (ONLY touched on ~3% purchasing sessions!)
+struct CampDayPurch {
     u32 purchasing_sessions = 0;
-    u32 assisted_sessions = 0;
     u32 pad = 0;
     i64 revenue_cents = 0;
 };
@@ -263,15 +267,18 @@ struct alignas(64) Worker {
     std::vector<u8>        dtab_long_used;
 
     pq::UserDailyCols ud_cols;
-    std::vector<CampDayStat> cd_stats;
+    std::vector<CampDayHot>   cd_hot;
+    std::vector<CampDayPurch> cd_purch;
 
     u32 P_ = 0, DS_ = 0;
 
-    void init(int id, u32 P, u32 DS, u32 DL, u32 ncamp_plus1, u32 ndays, bool nt_stores) {
+    void init(int id, u32 P, u32 DS, u32 DL, u32 ncamp_plus1, u32 ndays, bool nt_stores, size_t arena_chunk = 48ULL << 20) {
         tid = id;
         use_nt = nt_stores;
         P_ = P;
         DS_ = DS;
+        p_arena.set_chunk_size(arena_chunk);
+        e_arena.set_chunk_size(arena_chunk);
         sp_parts.resize(P);
         lp_parts.resize(P);
         ep_parts.resize(P);
@@ -296,7 +303,8 @@ struct alignas(64) Worker {
         short_pidx.reserve(16384);
         long_pidx.reserve(4096);
         exotic_pidx.reserve(64);
-        cd_stats.assign(size_t(ncamp_plus1) * size_t(ndays), CampDayStat{});
+        cd_hot.assign(size_t(ncamp_plus1) * size_t(ndays), CampDayHot{});
+        cd_purch.assign(size_t(ncamp_plus1) * size_t(ndays), CampDayPurch{});
     }
 
     inline void copy64(void* dst, const void* src) const {
@@ -1028,14 +1036,9 @@ struct Pipeline {
                         for (ShortEBlock* b = workers[t].se_parts[q].head; b; b = b->next) {
                             const u32 bn = b->n;
                             const ShortERec* rr = b->r;
-                            u32 hbuf[256];
                             for (u32 i = 0; i < bn; ++i) {
-                                hbuf[i] = u32(wyhash64(rr[i].ekey)) & mask;
-                            }
-                            for (u32 i = 0; i < bn; ++i) {
-                                if (i + 8 < bn) __builtin_prefetch(&tab[hbuf[i + 8]], 1, 3);
                                 const ShortERec& e = rr[i];
-                                u32 idx = hbuf[i];
+                                u32 idx = u32(wyhash64(e.ekey)) & mask;
                                 for (;;) {
                                     ShortERec& s = tab[idx];
                                     if (s.ekey == 0) {
@@ -1168,21 +1171,27 @@ struct Pipeline {
 
         // LPT scheduling: sort partitions descending by total events so whale partitions start FIRST!
         std::vector<std::pair<u32, u32>> p_order(P);
+        u64 grand_ev = 0;
         for (u32 p = 0; p < P; ++p) {
             u32 tot = 0;
             for (int t = 0; t < nt; ++t) {
                 tot += workers[t].sp_parts[p].total + workers[t].lp_parts[p].total + workers[t].ep_parts[p].total;
             }
             p_order[p] = {tot, p};
+            grand_ev += tot;
         }
         std::sort(p_order.begin(), p_order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        const size_t est_rows_thr = std::max<size_t>(size_t(grand_ev / u64(nt * 6u)) + 16384u, 32768u);
+        const size_t est_ppl_thr  = std::max<size_t>(est_rows_thr / 3u + 4096u, 8192u);
 
         std::atomic<u32> next_pi{0};
         double grp_ms[16]{}, per_ms[16]{}, pq_ms[16]{};
 
         pool.run([&](int tid) {
             Worker& w = workers[tid];
-            w.ud_cols.reserve(350000, 120000);
+            w.e_arena.rewind();
+            w.ud_cols.reserve(est_rows_thr, est_ppl_thr, &w.e_arena);
 
             struct ShortLSlot {
                 u64 key;
@@ -1217,8 +1226,10 @@ struct Pipeline {
             std::vector<u32> ccnt(ncamp, 0);
             std::vector<u32> cact(ncamp, 0);
 
-            CampDayStat* cd = w.cd_stats.data();
-            CampDayStat* org_cd = cd + size_t(ncamp) * size_t(num_days);
+            CampDayHot*   cdh = w.cd_hot.data();
+            CampDayPurch* cdp = w.cd_purch.data();
+            CampDayHot*   org_h = cdh + size_t(ncamp) * size_t(num_days);
+            CampDayPurch* org_p = cdp + size_t(ncamp) * size_t(num_days);
 
             auto click_id_sv = [&](const LocalClick& c) -> std::string_view {
                 u32 fi = c.file_len >> 20;
@@ -1571,12 +1582,12 @@ struct Pipeline {
                     Session* S = sess_buf.data();
 
                     auto add_assist_s = [&](u32 c, u32 s_lo, u32 s_hi) {
-                        CampDayStat* row = cd + size_t(c) * size_t(num_days);
+                        CampDayHot* row = cdh + size_t(c) * size_t(num_days);
                         for (u32 j = s_lo; j < s_hi;) {
                             u16 d = S[j].day;
                             u32 e = j + 1;
                             while (e < s_hi && S[e].day == d) ++e;
-                            row[d].assisted_sessions += (e - j);
+                            row[d].assisted += (e - j);
                             j = e;
                         }
                     };
@@ -1610,10 +1621,11 @@ struct Pipeline {
                         std::string_view sv = decode_user_key(lkeys[pid], name_buf, user_exotic);
                         w.ud_cols.add_person_name(reinterpret_cast<const u8*>(sv.data()), u32(sv.size()), 1);
                         if (nc == 0) {
-                            CampDayStat& x = org_cd[d0];
-                            x.sessions++;
-                            x.purchasing_sessions += hp0;
-                            x.revenue_cents += i64(rev0);
+                            org_h[d0].sessions++;
+                            if (__builtin_expect(hp0 != 0, 0)) {
+                                org_p[d0].purchasing_sessions++;
+                                org_p[d0].revenue_cents += i64(rev0);
+                            }
                             continue;
                         }
                         S[0] = {ts0, 1, rev0, d0, hp0, 0};
@@ -1662,10 +1674,12 @@ struct Pipeline {
                             lo++;
                         }
                         u32 cr = (hi > lo) ? ck[hi - 1].camp : ncamp;
-                        CampDayStat& x = cd[size_t(cr) * size_t(num_days) + d0];
-                        x.sessions++;
-                        x.purchasing_sessions += hp0;
-                        x.revenue_cents += i64(rev0);
+                        size_t cdi = size_t(cr) * size_t(num_days) + d0;
+                        cdh[cdi].sessions++;
+                        if (__builtin_expect(hp0 != 0, 0)) {
+                            cdp[cdi].purchasing_sessions++;
+                            cdp[cdi].revenue_cents += i64(rev0);
+                        }
                         while (lo < hi) {
                             u32 c = ck[lo].camp;
                             if (--ccnt[c] == 0) add_assist_s(c, cact[c], ns);
@@ -1827,10 +1841,11 @@ struct Pipeline {
                         active_days++;
 
                         if (nc == 0) {
-                            CampDayStat& x = org_cd[d];
-                            x.sessions += d_sess;
-                            x.purchasing_sessions += d_ps;
-                            x.revenue_cents += d_rev;
+                            org_h[d].sessions += d_sess;
+                            if (__builtin_expect(d_ps != 0, 0)) {
+                                org_p[d].purchasing_sessions += d_ps;
+                                org_p[d].revenue_cents += d_rev;
+                            }
                         }
                     }
 
@@ -1887,10 +1902,12 @@ struct Pipeline {
                             lo++;
                         }
                         u32 cr = (hi > lo) ? ck[hi - 1].camp : ncamp;
-                        CampDayStat& x = cd[size_t(cr) * size_t(num_days) + S[s].day];
-                        x.sessions++;
-                        x.purchasing_sessions += S[s].has_p;
-                        x.revenue_cents += i64(S[s].rev);
+                        size_t cdi = size_t(cr) * size_t(num_days) + S[s].day;
+                        cdh[cdi].sessions++;
+                        if (__builtin_expect(S[s].has_p != 0, 0)) {
+                            cdp[cdi].purchasing_sessions++;
+                            cdp[cdi].revenue_cents += i64(S[s].rev);
+                        }
                     }
                     while (lo < hi) {
                         u32 c = ck[lo].camp;
@@ -1931,14 +1948,16 @@ struct Pipeline {
     void write_campaign_daily() {
         const u32 ncamp_plus1 = cats.num_campaigns + 1u;
         const size_t total = size_t(ncamp_plus1) * size_t(num_days);
-        std::vector<CampDayStat> merged(total);
+        std::vector<CampDayHot>   mh(total);
+        std::vector<CampDayPurch> mp(total);
         for (int t = 0; t < int(workers.size()); ++t) {
-            const auto& src = workers[t].cd_stats;
+            const auto& sh = workers[t].cd_hot;
+            const auto& sp = workers[t].cd_purch;
             for (size_t i = 0; i < total; ++i) {
-                merged[i].sessions            += src[i].sessions;
-                merged[i].purchasing_sessions += src[i].purchasing_sessions;
-                merged[i].assisted_sessions   += src[i].assisted_sessions;
-                merged[i].revenue_cents       += src[i].revenue_cents;
+                mh[i].sessions            += sh[i].sessions;
+                mh[i].assisted            += sh[i].assisted;
+                mp[i].purchasing_sessions += sp[i].purchasing_sessions;
+                mp[i].revenue_cents       += sp[i].revenue_cents;
             }
         }
 
@@ -1946,15 +1965,15 @@ struct Pipeline {
         rows.reserve(total / 2 + 16);
         for (u32 c = 0; c < ncamp_plus1; ++c) {
             for (u32 d = 0; d < num_days; ++d) {
-                const CampDayStat& st = merged[size_t(c) * size_t(num_days) + d];
-                if (st.sessions > 0 || st.assisted_sessions > 0) {
+                size_t idx = size_t(c) * size_t(num_days) + d;
+                if (mh[idx].sessions > 0 || mh[idx].assisted > 0) {
                     rows.push_back({
                         c,
                         i32(base_day + d),
-                        i32(st.sessions),
-                        i32(st.purchasing_sessions),
-                        st.revenue_cents,
-                        i32(st.assisted_sessions),
+                        i32(mh[idx].sessions),
+                        i32(mp[idx].purchasing_sessions),
+                        mp[idx].revenue_cents,
+                        i32(mh[idx].assisted),
                     });
                 }
             }
@@ -2035,9 +2054,12 @@ struct Pipeline {
         links.build_with_catalogs(link_files, cats, data_dir, pool, user_exotic, prof);
         prof.mark("cat+links+bloom");
 
+        size_t arena_chunk = (total_ev_bytes < (256u << 20)) ? (8ULL << 20)
+                           : (total_ev_bytes < (3000ULL << 20)) ? (48ULL << 20)
+                           : (128ULL << 20);
         workers.resize(eff_ncpu);
         for (int t = 0; t < eff_ncpu; ++t) {
-            workers[t].init(t, P, DS, DL, cats.num_campaigns + 1u, num_days, use_nt_stores);
+            workers[t].init(t, P, DS, DL, cats.num_campaigns + 1u, num_days, use_nt_stores, arena_chunk);
         }
 
         parse_events_and_clicks(pool);
