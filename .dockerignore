@@ -1,0 +1,12 @@
+.git
+.gitignore
+.local
+docs
+out
+dev
+dev-answer
+build
+scripts
+tests
+*.md
+!Dockerfile

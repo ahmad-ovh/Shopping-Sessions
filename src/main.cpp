@@ -1,0 +1,1522 @@
+#include "catalog_links.hpp"
+#include "common.hpp"
+#include "csv_time.hpp"
+#include "keys.hpp"
+#include "parquet.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <sys/stat.h>
+#include <vector>
+
+namespace hyp {
+
+// ============================================================================
+// Data Records & Block Streams
+// ============================================================================
+
+// Short canonical user event block: 336 * (8 + 4) + 16 = 4048 B (fits in 1 4KB page!)
+static constexpr u32 SHORT_PBLK_CAP = 336;
+struct alignas(64) ShortPBlock {
+    ShortPBlock* next;
+    u32 n;
+    u32 pad;
+    u64 ukey[SHORT_PBLK_CAP];
+    u32 ts[SHORT_PBLK_CAP];
+};
+
+// Long-hex canonical user event block (12.5% of events)
+static constexpr u32 LONG_PBLK_CAP = 168;
+struct alignas(64) LongPBlock {
+    LongPBlock* next;
+    u32 n;
+    u32 pad;
+    u64 hi[LONG_PBLK_CAP];
+    u64 lo[LONG_PBLK_CAP];
+    u32 ts[LONG_PBLK_CAP];
+};
+
+// Exotic canonical user event block (<0.01% of events + fixtures)
+static constexpr u32 EXOTIC_PBLK_CAP = 256;
+struct alignas(64) ExoticPBlock {
+    ExoticPBlock* next;
+    u32 n;
+    u32 pad;
+    u32 eid[EXOTIC_PBLK_CAP];
+    u32 ts[EXOTIC_PBLK_CAP];
+};
+
+// Purchase side-stream (only ~3% of valid events!)
+struct PurchRec {
+    u64 u_lo;
+    u64 u_hi;
+    u32 ts;
+    u32 price;
+    u32 ploc;    // back-pointer to its PRec so dead duplicates are skipped in O(1)!
+    u16 cat;
+    u8  u_dom;
+    u8  pad;
+};
+static constexpr u32 PURCH_BLK_CAP = 126;
+struct alignas(64) PurchBlock {
+    PurchBlock* next;
+    u32 n;
+    u32 pad;
+    PurchRec r[PURCH_BLK_CAP];
+};
+
+// Valid click record (no global click dedup needed; lazy click_id for same-ms ties!)
+struct ClickRec {
+    u64 u_lo;
+    u64 u_hi;
+    u32 ts;        // ts - click_start
+    u32 camp_dom;  // (u_dom << 30) | camp_idx
+    u32 file_len;  // (file_idx << 20) | (cid_len & 0xFFFFF)
+    u32 cid_off;   // byte offset of click_id in click_files[file_idx]
+};
+static constexpr u32 CLICK_BLK_CAP = 126;
+struct alignas(64) ClickBlock {
+    ClickBlock* next;
+    u32 n;
+    u32 pad;
+    ClickRec r[CLICK_BLK_CAP];
+};
+
+// Exact disjoint dedup records
+struct ShortERec {
+    u64 ekey;    // DOM_SHORT exact 64-bit raw key (always non-zero)
+    u32 ing_sec; // ingest_ts_sec - ing_origin_sec
+    u32 loc;     // back-pointer to PRec (or INVALID_LOC)
+};
+static constexpr u32 SHORT_EBLK_CAP = 254;
+struct alignas(64) ShortEBlock {
+    ShortEBlock* next;
+    u32 n;
+    u32 pad;
+    ShortERec r[SHORT_EBLK_CAP];
+};
+
+struct LongERec {
+    u64 hi;
+    u64 lo;
+    u32 ing_sec;
+    u32 loc;
+};
+static constexpr u32 LONG_EBLK_CAP = 168;
+struct alignas(64) LongEBlock {
+    LongEBlock* next;
+    u32 n;
+    u32 pad;
+    LongERec r[LONG_EBLK_CAP];
+};
+
+struct ExoticERec {
+    u32 eid;
+    u32 loc;
+    i64 ing_ms;
+};
+
+// Loc packing: [dom: 2 bits | tid: 4 bits | seq: 26 bits]
+// Supports up to 16 threads and 67M events per thread per domain (536M events on 8 threads).
+static inline u32 pack_loc(u8 dom, int tid, u32 seq) {
+    return (u32(dom) << 30) | (u32(tid) << 26) | seq;
+}
+
+template <class Block>
+struct BlockList {
+    Block* head = nullptr;
+    Block* tail = nullptr;
+    u32 total = 0;
+};
+
+struct CampDayStat {
+    u32 sessions = 0;
+    u32 purchasing_sessions = 0;
+    u32 assisted_sessions = 0;
+    u32 pad = 0;
+    i64 revenue_cents = 0;
+};
+
+// Per-worker state (cache-line separated)
+struct alignas(64) Worker {
+    int tid = 0;
+    SlabArena p_arena;
+    SlabArena e_arena;
+
+    // Indexed vectors of all emitted PBlocks for O(1) loc -> ts_slot lookup during dedup kill!
+    std::vector<ShortPBlock*> short_pidx;
+    std::vector<LongPBlock*>  long_pidx;
+    std::vector<ExoticPBlock*> exotic_pidx;
+
+    // Partitioned person streams (size = g_P)
+    std::vector<BlockList<ShortPBlock>>  sp_parts;
+    std::vector<BlockList<LongPBlock>>   lp_parts;
+    std::vector<BlockList<ExoticPBlock>> ep_parts;
+    std::vector<BlockList<PurchBlock>>   pu_parts;
+    std::vector<BlockList<ClickBlock>>   ck_parts;
+
+    // Partitioned dedup streams
+    std::vector<BlockList<ShortEBlock>> se_parts; // size = g_DS
+    std::vector<BlockList<LongEBlock>>  le_parts; // size = g_DL
+    std::vector<ExoticERec> exotic_erecs;
+
+    // Reusable per-worker scratch for dedup & sessions
+    std::vector<ShortERec> dtab_short;
+    std::vector<LongERec>  dtab_long;
+    std::vector<u8>        dtab_long_used;
+
+    // Per-worker outputs
+    pq::UserDailyCols ud_cols;
+    std::vector<CampDayStat> cd_stats; // [(ncamp + 1) * ndays]
+
+    void init(int id, u32 P, u32 DS, u32 DL, u32 ncamp_plus1, u32 ndays) {
+        tid = id;
+        sp_parts.resize(P);
+        lp_parts.resize(P);
+        ep_parts.resize(P);
+        pu_parts.resize(P);
+        ck_parts.resize(P);
+        se_parts.resize(DS);
+        le_parts.resize(DL);
+        short_pidx.reserve(16384);
+        long_pidx.reserve(4096);
+        exotic_pidx.reserve(64);
+        cd_stats.assign(size_t(ncamp_plus1) * size_t(ndays), CampDayStat{});
+    }
+
+    inline u32 emit_short_p(u32 p, u64 ukey, u32 ts) {
+        auto& lst = sp_parts[p];
+        ShortPBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == SHORT_PBLK_CAP, 0)) {
+            b = static_cast<ShortPBlock*>(p_arena.alloc(sizeof(ShortPBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            b->pad = u32(short_pidx.size());
+            short_pidx.push_back(b);
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        u32 slot = b->n++;
+        b->ukey[slot] = ukey;
+        b->ts[slot] = ts;
+        lst.total++;
+        return pack_loc(DOM_SHORT, tid, b->pad * SHORT_PBLK_CAP + slot);
+    }
+
+    inline u32 emit_long_p(u32 p, u64 hi, u64 lo, u32 ts) {
+        auto& lst = lp_parts[p];
+        LongPBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == LONG_PBLK_CAP, 0)) {
+            b = static_cast<LongPBlock*>(p_arena.alloc(sizeof(LongPBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            b->pad = u32(long_pidx.size());
+            long_pidx.push_back(b);
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        u32 slot = b->n++;
+        b->hi[slot] = hi;
+        b->lo[slot] = lo;
+        b->ts[slot] = ts;
+        lst.total++;
+        return pack_loc(DOM_HEX32, tid, b->pad * LONG_PBLK_CAP + slot);
+    }
+
+    inline u32 emit_exotic_p(u32 p, u32 eid, u32 ts) {
+        auto& lst = ep_parts[p];
+        ExoticPBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == EXOTIC_PBLK_CAP, 0)) {
+            b = static_cast<ExoticPBlock*>(p_arena.alloc(sizeof(ExoticPBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            b->pad = u32(exotic_pidx.size());
+            exotic_pidx.push_back(b);
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        u32 slot = b->n++;
+        b->eid[slot] = eid;
+        b->ts[slot] = ts;
+        lst.total++;
+        return pack_loc(DOM_EXOTIC, tid, b->pad * EXOTIC_PBLK_CAP + slot);
+    }
+
+    inline void emit_purch(u32 p, const PurchRec& pr) {
+        auto& lst = pu_parts[p];
+        PurchBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == PURCH_BLK_CAP, 0)) {
+            b = static_cast<PurchBlock*>(p_arena.alloc(sizeof(PurchBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        b->r[b->n++] = pr;
+        lst.total++;
+    }
+
+    inline void emit_click(u32 p, const ClickRec& cr) {
+        auto& lst = ck_parts[p];
+        ClickBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == CLICK_BLK_CAP, 0)) {
+            b = static_cast<ClickBlock*>(p_arena.alloc(sizeof(ClickBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        b->r[b->n++] = cr;
+        lst.total++;
+    }
+
+    inline void emit_short_e(u32 q, const ShortERec& er) {
+        auto& lst = se_parts[q];
+        ShortEBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == SHORT_EBLK_CAP, 0)) {
+            b = static_cast<ShortEBlock*>(e_arena.alloc(sizeof(ShortEBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        b->r[b->n++] = er;
+        lst.total++;
+    }
+
+    inline void emit_long_e(u32 q, const LongERec& er) {
+        auto& lst = le_parts[q];
+        LongEBlock* b = lst.tail;
+        if (__builtin_expect(!b || b->n == LONG_EBLK_CAP, 0)) {
+            b = static_cast<LongEBlock*>(e_arena.alloc(sizeof(LongEBlock), 64));
+            b->next = nullptr;
+            b->n = 0;
+            if (lst.tail) lst.tail->next = b;
+            else lst.head = b;
+            lst.tail = b;
+        }
+        b->r[b->n++] = er;
+        lst.total++;
+    }
+};
+
+// ============================================================================
+// Global Pipeline Context
+// ============================================================================
+
+struct Pipeline {
+    std::string data_dir;
+    std::string out_dir;
+    int ncpu = 8;
+
+    i64 window_start = 0;
+    i64 window_end = 0;
+    i64 click_start = 0;
+    i64 base_day = 0;
+    u32 num_days = 1;
+    i64 ing_origin_sec = 0;
+    u32 num_bins = 0; // 30-min bins covering [window_start, window_end)
+
+    FastTime ftime;
+    Catalogs cats;
+    ExoticInterner user_exotic;
+    ExoticInterner event_exotic;
+    LinkResolver links;
+
+    std::vector<MFile> link_files;
+    std::vector<MFile> event_files;
+    std::vector<MFile> click_files;
+
+    u32 P = 1024;
+    u32 DS = 1024;
+    u32 DL = 256;
+
+    std::vector<Worker> workers;
+    Profiler prof;
+
+    inline u32* loc_ts_ptr(u32 loc) {
+        u8 dom = u8(loc >> 30);
+        int tid = int((loc >> 26) & 0xFu);
+        u32 seq = loc & ((1u << 26) - 1u);
+        Worker& w = workers[tid];
+        if (dom == DOM_SHORT) {
+            return &w.short_pidx[seq / SHORT_PBLK_CAP]->ts[seq % SHORT_PBLK_CAP];
+        }
+        if (dom == DOM_HEX32) {
+            return &w.long_pidx[seq / LONG_PBLK_CAP]->ts[seq % LONG_PBLK_CAP];
+        }
+        return &w.exotic_pidx[seq / EXOTIC_PBLK_CAP]->ts[seq % EXOTIC_PBLK_CAP];
+    }
+
+    inline void kill_loc(u32 loc) {
+        if (loc == INVALID_LOC) return;
+        __atomic_store_n(loc_ts_ptr(loc), DEAD_TS, __ATOMIC_RELAXED);
+    }
+
+    inline bool is_loc_dead(u32 loc) {
+        return *loc_ts_ptr(loc) == DEAD_TS;
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 1: Parse Events & Clicks with 64-Row Prefetched Bloom + Alias Pipeline
+    // ------------------------------------------------------------------------
+    struct PendEvent {
+        u64 eid_lo;
+        u64 eid_hi;
+        u8  eid_dom;
+        u8  is_purch;
+        u16 cat;
+        u32 ing_sec;
+        i64 ing_ms;
+        UserKey raw_user;
+        u64 uhash;
+        u32 ts_rel;
+        u32 price;
+    };
+
+    struct PendClick {
+        UserKey raw_user;
+        u64 uhash;
+        u32 ts_rel;
+        u32 camp;
+        u32 file_len;
+        u32 cid_off;
+    };
+
+    void flush_events(Worker& w, PendEvent* buf, int n) {
+        if (n == 0) return;
+        const bool check_links = links.has_aliases;
+        u8 hit[64];
+
+        if (check_links) {
+            // Pass 1: Prefetch Bloom filter words for all buffered events
+            for (int i = 0; i < n; ++i) {
+                if (buf[i].raw_user.dom != DOM_EXOTIC) {
+                    links.prefetch_bloom(buf[i].uhash);
+                }
+            }
+            // Pass 2: Check Bloom filter and prefetch alias table ONLY for hits (~35-40%)
+            for (int i = 0; i < n; ++i) {
+                u8 d = buf[i].raw_user.dom;
+                if (d == DOM_SHORT) {
+                    bool h = links.bloom_may_contain(buf[i].uhash);
+                    hit[i] = h ? 1 : 0;
+                    if (h) links.prefetch_short_alias(buf[i].uhash);
+                } else if (d == DOM_HEX32) {
+                    bool h = links.bloom_may_contain(buf[i].uhash);
+                    hit[i] = h ? 1 : 0;
+                    if (h) links.prefetch_hex_alias(buf[i].uhash);
+                } else {
+                    hit[i] = 1;
+                }
+            }
+        }
+
+        // Pass 3: Resolve canonical person -> scatter directly to person partition + dedup bucket!
+        for (int i = 0; i < n; ++i) {
+            const PendEvent& pe = buf[i];
+            UserKey canon = pe.raw_user;
+            if (check_links && hit[i]) {
+                if (canon.dom == DOM_SHORT) {
+                    canon = links.resolve_short_hit(canon.lo, pe.uhash);
+                } else if (canon.dom == DOM_HEX32) {
+                    canon = links.resolve_hex_hit(canon.hi, canon.lo, pe.uhash);
+                } else {
+                    auto it = links.exotic_aliases.find(u32(canon.lo));
+                    if (it != links.exotic_aliases.end()) canon = it->second;
+                }
+            }
+
+            u64 ch = (canon.dom == pe.raw_user.dom && canon.lo == pe.raw_user.lo && canon.hi == pe.raw_user.hi)
+                     ? pe.uhash : hash_user_key(canon);
+            u32 p = u32(ch >> 32) & (P - 1u);
+
+            u32 loc;
+            if (__builtin_expect(canon.dom == DOM_SHORT, 1)) {
+                loc = w.emit_short_p(p, canon.lo, pe.ts_rel);
+            } else if (canon.dom == DOM_HEX32) {
+                loc = w.emit_long_p(p, canon.hi, canon.lo, pe.ts_rel);
+            } else {
+                loc = w.emit_exotic_p(p, u32(canon.lo), pe.ts_rel);
+            }
+
+            if (__builtin_expect(pe.is_purch, 0)) {
+                w.emit_purch(p, {canon.lo, canon.hi, pe.ts_rel, pe.price, loc, pe.cat, canon.dom, 0});
+            }
+
+            if (__builtin_expect(pe.eid_dom == DOM_SHORT, 1)) {
+                u32 q = u32(wyhash64(pe.eid_lo) >> 32) & (DS - 1u);
+                w.emit_short_e(q, {pe.eid_lo, pe.ing_sec, loc});
+            } else if (pe.eid_dom == DOM_HEX32) {
+                u32 q = u32(wyhash128(pe.eid_hi, pe.eid_lo) >> 32) & (DL - 1u);
+                w.emit_long_e(q, {pe.eid_hi, pe.eid_lo, pe.ing_sec, loc});
+            } else {
+                w.exotic_erecs.push_back({u32(pe.eid_lo), loc, pe.ing_ms});
+            }
+        }
+    }
+
+    void flush_clicks(Worker& w, PendClick* buf, int n) {
+        if (n == 0) return;
+        const bool check_links = links.has_aliases;
+        u8 hit[64];
+
+        if (check_links) {
+            for (int i = 0; i < n; ++i) {
+                if (buf[i].raw_user.dom != DOM_EXOTIC) links.prefetch_bloom(buf[i].uhash);
+            }
+            for (int i = 0; i < n; ++i) {
+                u8 d = buf[i].raw_user.dom;
+                if (d == DOM_SHORT) {
+                    bool h = links.bloom_may_contain(buf[i].uhash);
+                    hit[i] = h ? 1 : 0;
+                    if (h) links.prefetch_short_alias(buf[i].uhash);
+                } else if (d == DOM_HEX32) {
+                    bool h = links.bloom_may_contain(buf[i].uhash);
+                    hit[i] = h ? 1 : 0;
+                    if (h) links.prefetch_hex_alias(buf[i].uhash);
+                } else {
+                    hit[i] = 1;
+                }
+            }
+        }
+
+        for (int i = 0; i < n; ++i) {
+            const PendClick& pc = buf[i];
+            UserKey canon = pc.raw_user;
+            if (check_links && hit[i]) {
+                if (canon.dom == DOM_SHORT) {
+                    canon = links.resolve_short_hit(canon.lo, pc.uhash);
+                } else if (canon.dom == DOM_HEX32) {
+                    canon = links.resolve_hex_hit(canon.hi, canon.lo, pc.uhash);
+                } else {
+                    auto it = links.exotic_aliases.find(u32(canon.lo));
+                    if (it != links.exotic_aliases.end()) canon = it->second;
+                }
+            }
+            u64 ch = (canon.dom == pc.raw_user.dom && canon.lo == pc.raw_user.lo && canon.hi == pc.raw_user.hi)
+                     ? pc.uhash : hash_user_key(canon);
+            u32 p = u32(ch >> 32) & (P - 1u);
+            u32 camp_dom = (u32(canon.dom) << 30) | pc.camp;
+            w.emit_click(p, {canon.lo, canon.hi, pc.ts_rel, camp_dom, pc.file_len, pc.cid_off});
+        }
+    }
+
+    void parse_events_and_clicks(ThreadPool& pool) {
+        struct Task { u8 kind; u32 file; size_t s, e; }; // kind 0 = event, 1 = click
+        std::vector<Task> tasks;
+        tasks.reserve(2048);
+
+        auto add_tasks = [&](u8 kind, const std::vector<MFile>& files) {
+            constexpr size_t CSZ = 2u << 20; // 2 MiB chunks
+            for (u32 fi = 0; fi < files.size(); ++fi) {
+                const MFile& mf = files[fi];
+                if (mf.size == 0) continue;
+                const u8* nl = static_cast<const u8*>(std::memchr(mf.data, '\n', mf.size));
+                if (!nl) continue;
+                size_t body = size_t(nl - mf.data) + 1;
+                if (body >= mf.size) continue;
+                for (size_t off = body; off < mf.size; off += CSZ) {
+                    tasks.push_back({kind, fi, off, std::min(off + CSZ, mf.size)});
+                }
+            }
+        };
+        add_tasks(0, event_files);
+        add_tasks(1, click_files);
+
+        std::atomic<size_t> next_task{0};
+        pool.run([&](int tid) {
+            Worker& w = workers[tid];
+            PendEvent ev_buf[64];
+            PendClick ck_buf[64];
+            int nev = 0, nck = 0;
+
+            for (;;) {
+                size_t ti = next_task.fetch_add(1, std::memory_order_relaxed);
+                if (ti >= tasks.size()) break;
+                const Task& tk = tasks[ti];
+                const MFile& mf = (tk.kind == 0) ? event_files[tk.file] : click_files[tk.file];
+
+                size_t s = tk.s;
+                if (s > 0 && mf.data[s - 1] != '\n') {
+                    const u8* nl = static_cast<const u8*>(std::memchr(mf.data + s, '\n', mf.size - s));
+                    if (!nl) continue;
+                    s = size_t(nl - mf.data) + 1;
+                }
+                if (s >= tk.e) continue;
+                size_t e = tk.e;
+                if (e < mf.size && mf.data[e - 1] != '\n') {
+                    const u8* nl = static_cast<const u8*>(std::memchr(mf.data + e, '\n', mf.size - e));
+                    e = nl ? size_t(nl - mf.data) + 1 : mf.size;
+                }
+
+                if (tk.kind == 0) {
+                    // Events CSV: event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+                    scan_csv<7>(mf.data, s, e, [&](const Field fl[7]) {
+                        // Step 1: Drop empty event_id
+                        if (__builtin_expect(fl[0].n == 0, 0)) return;
+
+                        // Parse ingest_ts (rules.md: always valid F1; if ever bad, drop)
+                        i64 ing_ms = ftime.parse_f1(fl[3].p, fl[3].n);
+                        if (__builtin_expect(ing_ms == INVALID_TS, 0)) {
+                            // General fallback just in case
+                            ing_ms = parse_ts_general(fl[3].p, fl[3].n);
+                            if (ing_ms == INVALID_TS) return;
+                        }
+                        i64 ing_diff = (ing_ms / 1000LL) - ing_origin_sec;
+                        bool ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL && (ing_ms % 1000LL) == 0);
+
+                        // Encode event_id into exact disjoint domain
+                        u64 eid_lo = 0, eid_hi = 0;
+                        u8 eid_dom = DOM_EXOTIC;
+                        if (ing_compact) {
+                            u64 sw;
+                            if (try_pack_short<'e'>(fl[0].p, fl[0].n, sw)) {
+                                eid_lo = sw;
+                                eid_dom = DOM_SHORT;
+                            } else {
+                                Hex128 hx;
+                                if (try_pack_hex32<'e'>(fl[0].p, fl[0].n, hx)) {
+                                    eid_hi = hx.hi;
+                                    eid_lo = hx.lo;
+                                    eid_dom = DOM_HEX32;
+                                }
+                            }
+                        }
+                        if (__builtin_expect(eid_dom == DOM_EXOTIC, 0)) {
+                            eid_lo = event_exotic.intern(fl[0].p, fl[0].n);
+                        }
+
+                        // Step 3 & 4: Validate fields (NOTE: invalid copy STILL emits tombstone to dedup!)
+                        bool valid = (fl[1].n > 0 && fl[5].n > 0);
+                        i64 ts = INVALID_TS;
+                        u8 is_purch = 0;
+                        u32 price = 0;
+                        u16 cat = 0;
+
+                        if (__builtin_expect(valid, 1)) {
+                            ts = ftime.parse(fl[2].p, fl[2].n);
+                            valid = (ts >= window_start && ts < window_end && (ing_ms - ts) <= DAY_MS);
+                        }
+                        if (__builtin_expect(valid, 1)) {
+                            const u8* tp = fl[4].p;
+                            u32 tn = fl[4].n;
+                            if (tn == 4) {
+                                u32 w4;
+                                std::memcpy(&w4, tp, 4);
+                                valid = (w4 == 0x77656976u /*"view"*/) || (w4 == 0x74726163u /*"cart"*/);
+                            } else if (tn == 8) {
+                                u64 w8;
+                                std::memcpy(&w8, tp, 8);
+                                if (w8 == 0x6573616863727570ULL /*"purchase"*/) {
+                                    is_purch = 1;
+                                    valid = parse_price_cents(fl[6].p, fl[6].n, price);
+                                    if (valid) {
+                                        cat = cats.lookup_product(fl[5].p, fl[5].n);
+                                    }
+                                } else {
+                                    valid = false;
+                                }
+                            } else {
+                                valid = false;
+                            }
+                        }
+
+                        if (__builtin_expect(!valid, 0)) {
+                            // Emit invalid tombstone into dedup so earlier invalid copy poisons later valid copies!
+                            if (eid_dom == DOM_SHORT) {
+                                u32 q = u32(wyhash64(eid_lo) >> 32) & (DS - 1u);
+                                w.emit_short_e(q, {eid_lo, u32(ing_diff), INVALID_LOC});
+                            } else if (eid_dom == DOM_HEX32) {
+                                u32 q = u32(wyhash128(eid_hi, eid_lo) >> 32) & (DL - 1u);
+                                w.emit_long_e(q, {eid_hi, eid_lo, u32(ing_diff), INVALID_LOC});
+                            } else {
+                                w.exotic_erecs.push_back({u32(eid_lo), INVALID_LOC, ing_ms});
+                            }
+                            return;
+                        }
+
+                        UserKey uk = encode_user_key(fl[1].p, fl[1].n, user_exotic);
+                        PendEvent& pe = ev_buf[nev++];
+                        pe.eid_lo = eid_lo;
+                        pe.eid_hi = eid_hi;
+                        pe.eid_dom = eid_dom;
+                        pe.is_purch = is_purch;
+                        pe.cat = cat;
+                        pe.ing_sec = u32(ing_diff);
+                        pe.ing_ms = ing_ms;
+                        pe.raw_user = uk;
+                        pe.uhash = hash_user_key(uk);
+                        pe.ts_rel = u32(ts - window_start);
+                        pe.price = price;
+                        if (nev == 64) {
+                            flush_events(w, ev_buf, nev);
+                            nev = 0;
+                        }
+                    });
+                } else {
+                    // Clicks CSV: click_id,user_id,campaign_id,ts
+                    const u32 fshift = tk.file << 20;
+                    scan_csv<4>(mf.data, s, e, [&](const Field fl[4]) {
+                        if (__builtin_expect(fl[0].n == 0 || fl[1].n == 0, 0)) return;
+                        i32 camp = cats.lookup_campaign(fl[2].p, fl[2].n);
+                        if (__builtin_expect(camp < 0, 0)) return;
+                        i64 ts = ftime.parse(fl[3].p, fl[3].n);
+                        if (__builtin_expect(ts < click_start || ts >= window_end, 0)) return;
+
+                        UserKey uk = encode_user_key(fl[1].p, fl[1].n, user_exotic);
+                        PendClick& pc = ck_buf[nck++];
+                        pc.raw_user = uk;
+                        pc.uhash = hash_user_key(uk);
+                        pc.ts_rel = u32(ts - click_start);
+                        pc.camp = u32(camp);
+                        pc.file_len = fshift | (fl[0].n & 0xFFFFFu);
+                        pc.cid_off = u32(fl[0].p - mf.data);
+                        if (nck == 64) {
+                            flush_clicks(w, ck_buf, nck);
+                            nck = 0;
+                        }
+                    });
+                }
+            }
+            flush_events(w, ev_buf, nev);
+            flush_clicks(w, ck_buf, nck);
+        });
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 2: Parallel L2-Resident Exact Deduplication (kills ~3% losers in place!)
+    // ------------------------------------------------------------------------
+    void dedup_phase(ThreadPool& pool) {
+        const int nt = pool.size();
+        const u32 total_tasks = DS + DL;
+        std::atomic<u32> next_q{0};
+
+        pool.run([&](int tid) {
+            Worker& w = workers[tid];
+            for (;;) {
+                u32 task = next_q.fetch_add(1, std::memory_order_relaxed);
+                if (task >= total_tasks) break;
+
+                if (task < DS) {
+                    u32 q = task;
+                    u32 n = 0;
+                    for (int t = 0; t < nt; ++t) n += workers[t].se_parts[q].total;
+                    if (n == 0) continue;
+
+                    u32 cap = 16;
+                    while (cap < n * 2) cap <<= 1;
+                    if (w.dtab_short.size() < cap) w.dtab_short.resize(cap);
+                    ShortERec* tab = w.dtab_short.data();
+                    std::memset(tab, 0, size_t(cap) * sizeof(ShortERec));
+                    const u32 mask = cap - 1u;
+
+                    for (int t = 0; t < nt; ++t) {
+                        for (ShortEBlock* b = workers[t].se_parts[q].head; b; b = b->next) {
+                            const u32 bn = b->n;
+                            for (u32 i = 0; i < bn; ++i) {
+                                const ShortERec& e = b->r[i];
+                                u32 idx = u32(wyhash64(e.ekey)) & mask;
+                                for (;;) {
+                                    ShortERec& s = tab[idx];
+                                    if (s.ekey == 0) {
+                                        s = e;
+                                        break;
+                                    }
+                                    if (s.ekey == e.ekey) {
+                                        if (e.ing_sec < s.ing_sec) {
+                                            kill_loc(s.loc);
+                                            s = e;
+                                        } else {
+                                            kill_loc(e.loc);
+                                        }
+                                        break;
+                                    }
+                                    idx = (idx + 1u) & mask;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    u32 q = task - DS;
+                    u32 n = 0;
+                    for (int t = 0; t < nt; ++t) n += workers[t].le_parts[q].total;
+                    if (n == 0) continue;
+
+                    u32 cap = 16;
+                    while (cap < n * 2) cap <<= 1;
+                    if (w.dtab_long.size() < cap) w.dtab_long.resize(cap);
+                    if (w.dtab_long_used.size() < cap) w.dtab_long_used.resize(cap);
+                    LongERec* tab = w.dtab_long.data();
+                    u8* used = w.dtab_long_used.data();
+                    std::memset(used, 0, cap);
+                    const u32 mask = cap - 1u;
+
+                    for (int t = 0; t < nt; ++t) {
+                        for (LongEBlock* b = workers[t].le_parts[q].head; b; b = b->next) {
+                            const u32 bn = b->n;
+                            for (u32 i = 0; i < bn; ++i) {
+                                const LongERec& e = b->r[i];
+                                u32 idx = u32(wyhash128(e.hi, e.lo)) & mask;
+                                for (;;) {
+                                    if (!used[idx]) {
+                                        used[idx] = 1;
+                                        tab[idx] = e;
+                                        break;
+                                    }
+                                    LongERec& s = tab[idx];
+                                    if (s.hi == e.hi && s.lo == e.lo) {
+                                        if (e.ing_sec < s.ing_sec) {
+                                            kill_loc(s.loc);
+                                            s = e;
+                                        } else {
+                                            kill_loc(e.loc);
+                                        }
+                                        break;
+                                    }
+                                    idx = (idx + 1u) & mask;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Deduplicate tiny exotic_erecs (typically 0 on generator data, small on fixtures)
+        size_t total_ex = 0;
+        for (int t = 0; t < nt; ++t) total_ex += workers[t].exotic_erecs.size();
+        if (total_ex > 0) {
+            std::unordered_map<u32, std::pair<i64, u32>> emap;
+            emap.reserve(total_ex * 2);
+            for (int t = 0; t < nt; ++t) {
+                for (const auto& e : workers[t].exotic_erecs) {
+                    auto it = emap.find(e.eid);
+                    if (it == emap.end()) {
+                        emap.emplace(e.eid, std::make_pair(e.ing_ms, e.loc));
+                    } else {
+                        if (e.ing_ms < it->second.first) {
+                            kill_loc(it->second.second);
+                            it->second = {e.ing_ms, e.loc};
+                        } else {
+                            kill_loc(e.loc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Phase 3: Parallel Person Partitions -> Sort-Free 30-Min Binning ->
+    //          O(S+C) Sliding-Window Attribution & Assists -> Parallel Parquet Write
+    // ------------------------------------------------------------------------
+    struct LocalClick {
+        u32 ts;
+        u32 camp;
+        u32 file_len;
+        u32 cid_off;
+    };
+
+    struct LocalPurch {
+        u32 ts;
+        u32 price;
+        u16 cat;
+    };
+
+    struct Bin {
+        u32 mn;
+        u32 mx;
+        u32 cnt;
+        u32 sid;
+    };
+
+    void sessions_and_write(ThreadPool& pool) {
+        const int nt = pool.size();
+        const u32 ncamp = cats.num_campaigns;
+        const u32 ncats = u32(cats.categories.size());
+        const bool use_binning = (num_bins > 0 && num_bins <= 1024);
+        const u32 nbin_words = (num_bins + 63u) >> 6;
+
+        std::atomic<u32> next_p{0};
+
+        pool.run([&](int tid) {
+            Worker& w = workers[tid];
+            w.ud_cols.reserve(600000, 100000);
+
+            // Thread-local grouping & sessionization scratch
+            struct LSlot {
+                UserKey key;
+                u32 pid;
+                u8 used;
+            };
+            std::vector<LSlot> ltab;
+            std::vector<UserKey> lkeys;
+            std::vector<u32> ev_cnt, pu_cnt, ck_cnt;
+            std::vector<u32> ev_off, pu_off, ck_off;
+            std::vector<u32> ev_ts;
+            std::vector<LocalPurch> pu_arr;
+            std::vector<LocalClick> ck_arr;
+
+            // Zero-sort 30-minute bins (<= 1024 bins = 16 KB, fits in L1!)
+            std::vector<Bin> bins(use_binning ? num_bins : 1, Bin{0xFFFFFFFFu, 0, 0, 0});
+            std::vector<u64> bmap(use_binning ? nbin_words : 1, 0);
+
+            std::vector<u32> s_start, s_nev;
+            std::vector<u16> s_day;
+            std::vector<u64> s_rev;
+            std::vector<u8>  s_has_p;
+            std::vector<u64> catday(size_t(num_days) * size_t(ncats), 0);
+
+            // Sliding window campaign state
+            std::vector<u32> ccnt(ncamp, 0);
+            std::vector<u32> cact(ncamp, 0);
+
+            CampDayStat* cd = w.cd_stats.data();
+            CampDayStat* org_cd = cd + size_t(ncamp) * size_t(num_days);
+
+            auto add_assist = [&](u32 c, u32 s_lo, u32 s_hi) {
+                CampDayStat* row = cd + size_t(c) * size_t(num_days);
+                for (u32 j = s_lo; j < s_hi;) {
+                    u16 d = s_day[j];
+                    u32 e = j + 1;
+                    while (e < s_hi && s_day[e] == d) ++e;
+                    row[d].assisted_sessions += (e - j);
+                    j = e;
+                }
+            };
+
+            auto click_id_sv = [&](const LocalClick& c) -> std::string_view {
+                u32 fi = c.file_len >> 20;
+                u32 len = c.file_len & 0xFFFFFu;
+                return std::string_view(
+                    reinterpret_cast<const char*>(click_files[fi].data + c.cid_off), len);
+            };
+
+            for (;;) {
+                u32 p = next_p.fetch_add(1, std::memory_order_relaxed);
+                if (p >= P) break;
+
+                // Estimate events in partition p
+                u32 est_ev = 0, est_pu = 0, est_ck = 0;
+                for (int t = 0; t < nt; ++t) {
+                    est_ev += workers[t].sp_parts[p].total +
+                              workers[t].lp_parts[p].total +
+                              workers[t].ep_parts[p].total;
+                    est_pu += workers[t].pu_parts[p].total;
+                    est_ck += workers[t].ck_parts[p].total;
+                }
+                if (est_ev == 0) continue;
+
+                // Size local person hash table (avg ~30 events/person -> est_ev/8 slots is plenty)
+                u32 lcap = 128;
+                u32 want = std::max<u32>(est_ev / 4u + 64u, 64u);
+                while (lcap < want) lcap <<= 1;
+                if (ltab.size() < lcap) ltab.resize(lcap);
+                for (u32 i = 0; i < lcap; ++i) ltab[i].used = 0;
+                u32 lmask = lcap - 1u;
+
+                lkeys.clear();
+                ev_cnt.clear();
+
+                auto grow_ltab = [&]() {
+                    u32 ncap = lcap << 1;
+                    std::vector<LSlot> ntab(ncap);
+                    for (u32 i = 0; i < ncap; ++i) ntab[i].used = 0;
+                    u32 nmask = ncap - 1u;
+                    for (u32 i = 0; i < lcap; ++i) {
+                        if (!ltab[i].used) continue;
+                        u32 idx = u32(hash_user_key(ltab[i].key)) & nmask;
+                        while (ntab[idx].used) idx = (idx + 1u) & nmask;
+                        ntab[idx] = ltab[i];
+                    }
+                    ltab.swap(ntab);
+                    lcap = ncap;
+                    lmask = nmask;
+                };
+
+                auto get_or_add_local = [&](const UserKey& k) -> u32 {
+                    if (__builtin_expect(lkeys.size() * 2 >= lcap, 0)) grow_ltab();
+                    u32 idx = u32(hash_user_key(k)) & lmask;
+                    for (;;) {
+                        LSlot& s = ltab[idx];
+                        if (!s.used) {
+                            u32 pid = u32(lkeys.size());
+                            s.key = k;
+                            s.pid = pid;
+                            s.used = 1;
+                            lkeys.push_back(k);
+                            ev_cnt.push_back(0);
+                            return pid;
+                        }
+                        if (s.key == k) return s.pid;
+                        idx = (idx + 1u) & lmask;
+                    }
+                };
+
+                auto find_local = [&](const UserKey& k) -> i32 {
+                    u32 idx = u32(hash_user_key(k)) & lmask;
+                    for (;;) {
+                        const LSlot& s = ltab[idx];
+                        if (!s.used) return -1;
+                        if (s.key == k) return i32(s.pid);
+                        idx = (idx + 1u) & lmask;
+                    }
+                };
+
+                // Pass 1: Count surviving events per local person
+                u32 total_live_ev = 0;
+                for (int t = 0; t < nt; ++t) {
+                    for (ShortPBlock* b = workers[t].sp_parts[p].head; b; b = b->next) {
+                        const u32 bn = b->n;
+                        for (u32 i = 0; i < bn; ++i) {
+                            if (__builtin_expect(b->ts[i] == DEAD_TS, 0)) continue;
+                            u32 pid = get_or_add_local({b->ukey[i], 0, DOM_SHORT});
+                            ev_cnt[pid]++;
+                            total_live_ev++;
+                        }
+                    }
+                    for (LongPBlock* b = workers[t].lp_parts[p].head; b; b = b->next) {
+                        const u32 bn = b->n;
+                        for (u32 i = 0; i < bn; ++i) {
+                            if (__builtin_expect(b->ts[i] == DEAD_TS, 0)) continue;
+                            u32 pid = get_or_add_local({b->lo[i], b->hi[i], DOM_HEX32});
+                            ev_cnt[pid]++;
+                            total_live_ev++;
+                        }
+                    }
+                    for (ExoticPBlock* b = workers[t].ep_parts[p].head; b; b = b->next) {
+                        const u32 bn = b->n;
+                        for (u32 i = 0; i < bn; ++i) {
+                            if (__builtin_expect(b->ts[i] == DEAD_TS, 0)) continue;
+                            u32 pid = get_or_add_local({b->eid[i], 0, DOM_EXOTIC});
+                            ev_cnt[pid]++;
+                            total_live_ev++;
+                        }
+                    }
+                }
+                const u32 np = u32(lkeys.size());
+                if (np == 0) continue;
+
+                // Prefix sum for events
+                ev_off.resize(np + 1);
+                {
+                    u32 run = 0;
+                    for (u32 i = 0; i < np; ++i) { ev_off[i] = run; run += ev_cnt[i]; }
+                    ev_off[np] = run;
+                }
+                if (ev_ts.size() < total_live_ev) ev_ts.resize(total_live_ev);
+                // Use ev_cnt as write cursor (restore from ev_off[i+1]-ev_off[i])
+                std::memcpy(ev_cnt.data(), ev_off.data(), np * sizeof(u32));
+
+                for (int t = 0; t < nt; ++t) {
+                    for (ShortPBlock* b = workers[t].sp_parts[p].head; b; b = b->next) {
+                        const u32 bn = b->n;
+                        for (u32 i = 0; i < bn; ++i) {
+                            u32 ts = b->ts[i];
+                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
+                            i32 pid = find_local({b->ukey[i], 0, DOM_SHORT});
+                            ev_ts[ev_cnt[pid]++] = ts;
+                        }
+                    }
+                    for (LongPBlock* b = workers[t].lp_parts[p].head; b; b = b->next) {
+                        const u32 bn = b->n;
+                        for (u32 i = 0; i < bn; ++i) {
+                            u32 ts = b->ts[i];
+                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
+                            i32 pid = find_local({b->lo[i], b->hi[i], DOM_HEX32});
+                            ev_ts[ev_cnt[pid]++] = ts;
+                        }
+                    }
+                    for (ExoticPBlock* b = workers[t].ep_parts[p].head; b; b = b->next) {
+                        const u32 bn = b->n;
+                        for (u32 i = 0; i < bn; ++i) {
+                            u32 ts = b->ts[i];
+                            if (__builtin_expect(ts == DEAD_TS, 0)) continue;
+                            i32 pid = find_local({b->eid[i], 0, DOM_EXOTIC});
+                            ev_ts[ev_cnt[pid]++] = ts;
+                        }
+                    }
+                }
+
+                // Purchases: count & scatter ONLY live purchases (skipping killed PRecs!)
+                pu_cnt.assign(np, 0);
+                u32 total_live_pu = 0;
+                if (est_pu > 0) {
+                    for (int t = 0; t < nt; ++t) {
+                        for (PurchBlock* b = workers[t].pu_parts[p].head; b; b = b->next) {
+                            const u32 bn = b->n;
+                            for (u32 i = 0; i < bn; ++i) {
+                                const PurchRec& pr = b->r[i];
+                                if (__builtin_expect(is_loc_dead(pr.ploc), 0)) continue;
+                                i32 pid = find_local({pr.u_lo, pr.u_hi, pr.u_dom});
+                                if (pid >= 0) {
+                                    pu_cnt[pid]++;
+                                    total_live_pu++;
+                                }
+                            }
+                        }
+                    }
+                }
+                pu_off.resize(np + 1);
+                {
+                    u32 run = 0;
+                    for (u32 i = 0; i < np; ++i) { pu_off[i] = run; run += pu_cnt[i]; }
+                    pu_off[np] = run;
+                }
+                if (total_live_pu > 0) {
+                    if (pu_arr.size() < total_live_pu) pu_arr.resize(total_live_pu);
+                    std::memcpy(pu_cnt.data(), pu_off.data(), np * sizeof(u32));
+                    for (int t = 0; t < nt; ++t) {
+                        for (PurchBlock* b = workers[t].pu_parts[p].head; b; b = b->next) {
+                            const u32 bn = b->n;
+                            for (u32 i = 0; i < bn; ++i) {
+                                const PurchRec& pr = b->r[i];
+                                if (__builtin_expect(is_loc_dead(pr.ploc), 0)) continue;
+                                i32 pid = find_local({pr.u_lo, pr.u_hi, pr.u_dom});
+                                if (pid >= 0) {
+                                    pu_arr[pu_cnt[pid]++] = {pr.ts, pr.price, pr.cat};
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Clicks: count & scatter ONLY clicks belonging to people with >= 1 live event!
+                ck_cnt.assign(np, 0);
+                u32 total_live_ck = 0;
+                if (est_ck > 0) {
+                    for (int t = 0; t < nt; ++t) {
+                        for (ClickBlock* b = workers[t].ck_parts[p].head; b; b = b->next) {
+                            const u32 bn = b->n;
+                            for (u32 i = 0; i < bn; ++i) {
+                                const ClickRec& cr = b->r[i];
+                                i32 pid = find_local({cr.u_lo, cr.u_hi, u8(cr.camp_dom >> 30)});
+                                if (pid >= 0) {
+                                    ck_cnt[pid]++;
+                                    total_live_ck++;
+                                }
+                            }
+                        }
+                    }
+                }
+                ck_off.resize(np + 1);
+                {
+                    u32 run = 0;
+                    for (u32 i = 0; i < np; ++i) { ck_off[i] = run; run += ck_cnt[i]; }
+                    ck_off[np] = run;
+                }
+                if (total_live_ck > 0) {
+                    if (ck_arr.size() < total_live_ck) ck_arr.resize(total_live_ck);
+                    std::memcpy(ck_cnt.data(), ck_off.data(), np * sizeof(u32));
+                    for (int t = 0; t < nt; ++t) {
+                        for (ClickBlock* b = workers[t].ck_parts[p].head; b; b = b->next) {
+                            const u32 bn = b->n;
+                            for (u32 i = 0; i < bn; ++i) {
+                                const ClickRec& cr = b->r[i];
+                                i32 pid = find_local({cr.u_lo, cr.u_hi, u8(cr.camp_dom >> 30)});
+                                if (pid >= 0) {
+                                    ck_arr[ck_cnt[pid]++] = {cr.ts, cr.camp_dom & 0x3FFFFFFFu, cr.file_len, cr.cid_off};
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Process each person in this partition!
+                for (u32 pid = 0; pid < np; ++pid) {
+                    u32 e0 = ev_off[pid], e1 = ev_off[pid + 1];
+                    u32 ne = e1 - e0;
+                    u32 u0 = pu_off[pid], u1 = pu_off[pid + 1];
+                    u32 nu = u1 - u0;
+                    u32 c0 = ck_off[pid], c1 = ck_off[pid + 1];
+                    u32 nc = c1 - c0;
+
+                    u32 ns = 0;
+                    s_start.clear();
+                    s_nev.clear();
+                    s_day.clear();
+                    s_rev.clear();
+                    s_has_p.clear();
+
+                    if (__builtin_expect(use_binning, 1)) {
+                        // ZERO-SORT 30-MINUTE BITMASK SESSIONIZATION!
+                        const u32* ts = ev_ts.data() + e0;
+                        Bin* B = bins.data();
+                        u64* BM = bmap.data();
+                        for (u32 i = 0; i < ne; ++i) {
+                            u32 v = ts[i];
+                            u32 b = v / u32(SESSION_GAP_MS);
+                            Bin& e = B[b];
+                            if (v < e.mn) e.mn = v;
+                            if (v > e.mx) e.mx = v;
+                            e.cnt++;
+                            BM[b >> 6] |= (1ULL << (b & 63u));
+                        }
+
+                        u32 prev_mx = 0;
+                        for (u32 wi = 0; wi < nbin_words; ++wi) {
+                            u64 m = BM[wi];
+                            while (m) {
+                                u32 b = (wi << 6) + u32(__builtin_ctzll(m));
+                                m &= m - 1ULL;
+                                Bin& e = B[b];
+                                if (ns == 0 || (e.mn - prev_mx) > u32(SESSION_GAP_MS)) {
+                                    s_start.push_back(e.mn);
+                                    s_day.push_back(u16(floor_div_day(window_start + i64(e.mn)) - base_day));
+                                    s_nev.push_back(0);
+                                    s_rev.push_back(0);
+                                    s_has_p.push_back(0);
+                                    ns++;
+                                }
+                                s_nev[ns - 1] += e.cnt;
+                                prev_mx = e.mx;
+                                e.sid = ns - 1;
+                            }
+                        }
+
+                        // Map purchases directly to their session in O(1)!
+                        if (nu > 0) {
+                            const LocalPurch* pu = pu_arr.data() + u0;
+                            for (u32 i = 0; i < nu; ++i) {
+                                u32 sid = B[pu[i].ts / u32(SESSION_GAP_MS)].sid;
+                                s_rev[sid] += pu[i].price;
+                                s_has_p[sid] = 1;
+                                catday[size_t(s_day[sid]) * size_t(ncats) + pu[i].cat] += pu[i].price;
+                            }
+                        }
+
+                        // Clear ONLY occupied bins!
+                        for (u32 wi = 0; wi < nbin_words; ++wi) {
+                            u64 m = BM[wi];
+                            if (!m) continue;
+                            BM[wi] = 0;
+                            while (m) {
+                                u32 b = (wi << 6) + u32(__builtin_ctzll(m));
+                                m &= m - 1ULL;
+                                B[b] = {0xFFFFFFFFu, 0, 0, 0};
+                            }
+                        }
+                    } else {
+                        // Exact sort fallback for windows > 21 days
+                        u32* ts = ev_ts.data() + e0;
+                        std::sort(ts, ts + ne);
+                        u32 prev = 0;
+                        for (u32 i = 0; i < ne; ++i) {
+                            u32 v = ts[i];
+                            if (ns == 0 || (v - prev) > u32(SESSION_GAP_MS)) {
+                                s_start.push_back(v);
+                                s_day.push_back(u16(floor_div_day(window_start + i64(v)) - base_day));
+                                s_nev.push_back(0);
+                                s_rev.push_back(0);
+                                s_has_p.push_back(0);
+                                ns++;
+                            }
+                            s_nev[ns - 1]++;
+                            prev = v;
+                        }
+                        if (nu > 0) {
+                            const LocalPurch* pu = pu_arr.data() + u0;
+                            for (u32 i = 0; i < nu; ++i) {
+                                // Upper bound on s_start gives session index
+                                auto it = std::upper_bound(s_start.begin(), s_start.end(), pu[i].ts);
+                                u32 sid = u32((it - s_start.begin()) - 1);
+                                s_rev[sid] += pu[i].price;
+                                s_has_p[sid] = 1;
+                                catday[size_t(s_day[sid]) * size_t(ncats) + pu[i].cat] += pu[i].price;
+                            }
+                        }
+                    }
+
+                    // Emit user_daily rows for this person (contiguous by person for RLE_DICTIONARY!)
+                    u32 active_days = 0;
+                    for (u32 i = 0; i < ns;) {
+                        u16 d = s_day[i];
+                        u32 d_sess = 0, d_ev = 0, d_ps = 0;
+                        i64 d_rev = 0;
+                        do {
+                            d_sess++;
+                            d_ev += s_nev[i];
+                            d_rev += i64(s_rev[i]);
+                            d_ps += s_has_p[i];
+                            i++;
+                        } while (i < ns && s_day[i] == d);
+
+                        i32 best_cat = -1;
+                        if (d_ps > 0) {
+                            u64* cs = catday.data() + size_t(d) * size_t(ncats);
+                            u64 bv = 0;
+                            for (u32 c = 0; c < ncats; ++c) {
+                                if (cs[c] > bv) { bv = cs[c]; best_cat = i32(c); }
+                                cs[c] = 0;
+                            }
+                        }
+                        w.ud_cols.add_row(i32(base_day + d), i32(d_sess), i32(d_ev), d_rev, best_cat);
+                        active_days++;
+
+                        if (nc == 0) {
+                            CampDayStat& x = org_cd[d];
+                            x.sessions += d_sess;
+                            x.purchasing_sessions += d_ps;
+                            x.revenue_cents += d_rev;
+                        }
+                    }
+
+                    // Decode person name ONCE for all active_days of this person!
+                    u8 name_buf[33];
+                    std::string_view sv = decode_user_key(lkeys[pid], name_buf, user_exotic);
+                    w.ud_cols.add_person_name(reinterpret_cast<const u8*>(sv.data()), u32(sv.size()), active_days);
+
+                    if (nc == 0) continue;
+
+                    // Sort person's clicks by ts; break same-ms multi-campaign ties to smallest click_id LAST!
+                    LocalClick* ck = ck_arr.data() + c0;
+                    if (nc <= 24) {
+                        for (u32 a = 1; a < nc; ++a) {
+                            LocalClick v = ck[a];
+                            u32 b = a;
+                            while (b > 0 && ck[b - 1].ts > v.ts) { ck[b] = ck[b - 1]; --b; }
+                            ck[b] = v;
+                        }
+                    } else {
+                        std::sort(ck, ck + nc, [](const LocalClick& a, const LocalClick& b) {
+                            return a.ts < b.ts;
+                        });
+                    }
+
+                    for (u32 a = 0; a + 1 < nc;) {
+                        u32 b = a + 1;
+                        bool mixed = false;
+                        while (b < nc && ck[b].ts == ck[a].ts) {
+                            mixed |= (ck[b].camp != ck[a].camp);
+                            ++b;
+                        }
+                        if (__builtin_expect(mixed, 0)) {
+                            u32 best = a;
+                            std::string_view best_id = click_id_sv(ck[a]);
+                            for (u32 x = a + 1; x < b; ++x) {
+                                std::string_view cid = click_id_sv(ck[x]);
+                                if (cid < best_id) { best_id = cid; best = x; }
+                            }
+                            if (best != b - 1) std::swap(ck[best], ck[b - 1]);
+                        }
+                        a = b;
+                    }
+
+                    // O(ns + nc) Two-Pointer Sliding-Window Attribution & Assists!
+                    u32 lo = 0, hi = 0;
+                    for (u32 s = 0; s < ns; ++s) {
+                        u32 st = s_start[s] + u32(WEEK_MS); // convert to click-relative ms
+                        while (hi < nc && ck[hi].ts <= st) {
+                            u32 c = ck[hi].camp;
+                            if (ccnt[c]++ == 0) cact[c] = s;
+                            hi++;
+                        }
+                        while (lo < hi && ck[lo].ts + u32(WEEK_MS) < st) {
+                            u32 c = ck[lo].camp;
+                            if (--ccnt[c] == 0) add_assist(c, cact[c], s);
+                            lo++;
+                        }
+                        u32 cr = (hi > lo) ? ck[hi - 1].camp : ncamp;
+                        CampDayStat& x = cd[size_t(cr) * size_t(num_days) + s_day[s]];
+                        x.sessions++;
+                        x.purchasing_sessions += s_has_p[s];
+                        x.revenue_cents += i64(s_rev[s]);
+                    }
+                    while (lo < hi) {
+                        u32 c = ck[lo].camp;
+                        if (--ccnt[c] == 0) add_assist(c, cact[c], ns);
+                        lo++;
+                    }
+                }
+            }
+
+            // Write this worker's user_daily Parquet file in parallel!
+            if (!w.ud_cols.day.empty()) {
+                std::string path = out_dir + "/user_daily/part-" + std::to_string(tid) + ".parquet";
+                w.ud_cols.write_parquet(path, cats.categories);
+            }
+        });
+
+        // If ALL workers had 0 rows (empty dataset fixture!), thread 0 writes valid empty Parquet
+        bool any_ud = false;
+        for (int t = 0; t < nt; ++t) {
+            if (!workers[t].ud_cols.day.empty()) { any_ud = true; break; }
+        }
+        if (!any_ud) {
+            workers[0].ud_cols.write_parquet(out_dir + "/user_daily/part-0.parquet", cats.categories);
+        }
+    }
+
+    void write_campaign_daily() {
+        const u32 ncamp_plus1 = cats.num_campaigns + 1u;
+        const size_t total = size_t(ncamp_plus1) * size_t(num_days);
+        std::vector<CampDayStat> merged(total);
+        for (int t = 0; t < int(workers.size()); ++t) {
+            const auto& src = workers[t].cd_stats;
+            for (size_t i = 0; i < total; ++i) {
+                merged[i].sessions            += src[i].sessions;
+                merged[i].purchasing_sessions += src[i].purchasing_sessions;
+                merged[i].assisted_sessions   += src[i].assisted_sessions;
+                merged[i].revenue_cents       += src[i].revenue_cents;
+            }
+        }
+
+        std::vector<pq::CampaignDailyRow> rows;
+        rows.reserve(total / 2 + 16);
+        for (u32 c = 0; c < ncamp_plus1; ++c) {
+            for (u32 d = 0; d < num_days; ++d) {
+                const CampDayStat& st = merged[size_t(c) * size_t(num_days) + d];
+                if (st.sessions > 0 || st.assisted_sessions > 0) {
+                    rows.push_back({
+                        c,
+                        i32(base_day + d),
+                        i32(st.sessions),
+                        i32(st.purchasing_sessions),
+                        st.revenue_cents,
+                        i32(st.assisted_sessions),
+                    });
+                }
+            }
+        }
+
+        pq::write_campaign_daily_parquet(
+            out_dir + "/campaign_daily/part-0.parquet",
+            rows, cats.camp_ids, cats.camp_channels);
+    }
+
+    void run(int argc, char** argv) {
+        prof.init();
+
+        const char* env_data = std::getenv("DATA_DIR");
+        const char* env_out  = std::getenv("OUTPUT_DIR");
+        const char* env_ncpu = std::getenv("NCPU");
+        data_dir = (argc >= 3) ? argv[argc - 2] : (env_data ? env_data : "/data");
+        out_dir  = (argc >= 3) ? argv[argc - 1] : (env_out  ? env_out  : "/output");
+        ncpu = env_ncpu ? std::atoi(env_ncpu) : int(std::thread::hardware_concurrency());
+        if (ncpu < 1) ncpu = 1;
+        if (ncpu > 16) ncpu = 16;
+
+        // Create output directories
+        ::mkdir(out_dir.c_str(), 0777);
+        ::mkdir((out_dir + "/user_daily").c_str(), 0777);
+        ::mkdir((out_dir + "/campaign_daily").c_str(), 0777);
+
+        // Phase 0: Load manifest, open input files, load catalogs & links
+        load_manifest(data_dir + "/manifest.json", window_start, window_end);
+        click_start = window_start - WEEK_MS;
+        base_day = floor_div_day(window_start);
+        i64 end_day = (window_end > window_start) ? floor_div_day(window_end - 1) : base_day;
+        num_days = u32(std::max<i64>(1, end_day - base_day + 1));
+        ing_origin_sec = window_start / 1000LL - 30LL * 86400LL;
+        i64 win_span = std::max<i64>(0, window_end - window_start);
+        num_bins = u32((win_span + SESSION_GAP_MS - 1) / SESSION_GAP_MS);
+        ftime.init(window_start, window_end);
+
+        auto lpaths = list_csv_files(data_dir + "/links");
+        auto epaths = list_csv_files(data_dir + "/events");
+        auto cpaths = list_csv_files(data_dir + "/clicks");
+
+        size_t total_ev_bytes = 0;
+        link_files.resize(lpaths.size());
+        for (size_t i = 0; i < lpaths.size(); ++i) {
+            if (!link_files[i].open_map(lpaths[i])) die("open link file");
+            link_files[i].close_fd();
+        }
+        event_files.resize(epaths.size());
+        for (size_t i = 0; i < epaths.size(); ++i) {
+            if (!event_files[i].open_map(epaths[i])) die("open event file");
+            total_ev_bytes += event_files[i].size;
+            event_files[i].close_fd();
+        }
+        click_files.resize(cpaths.size());
+        for (size_t i = 0; i < cpaths.size(); ++i) {
+            if (!click_files[i].open_map(cpaths[i])) die("open click file");
+            click_files[i].close_fd();
+        }
+
+        // Adaptive partition sizing for L2-cache residency from 1K fixtures up to 60M+ final!
+        if (total_ev_bytes < (16u << 20)) {
+            P = 64; DS = 64; DL = 32;
+        } else if (total_ev_bytes < (256u << 20)) {
+            P = 256; DS = 256; DL = 64;
+        } else if (total_ev_bytes < (3000ULL << 20)) {
+            // ~20M practice (~1.7 GB CSV)
+            P = 1024; DS = 2048; DL = 256;
+        } else {
+            // ~60M final (~5.5 GB CSV)
+            P = 2048; DS = 4096; DL = 512;
+        }
+
+        // For tiny fixtures, use 1 thread to avoid thread startup overhead
+        int eff_ncpu = (total_ev_bytes < (256u << 10)) ? 1 : ncpu;
+        ThreadPool pool(eff_ncpu);
+        prof.mark("open+init");
+
+        // Load products & campaigns (tiny: < 1 ms)
+        cats.load_products(data_dir + "/products.csv");
+        cats.load_campaigns(data_dir + "/campaigns.csv");
+        prof.mark("catalogs");
+
+        // Build links DSU + Blocked Bloom + Non-Canonical Alias Table
+        links.build(link_files, pool, user_exotic);
+        prof.mark("links+bloom");
+
+        // Initialize per-worker state
+        workers.resize(eff_ncpu);
+        for (int t = 0; t < eff_ncpu; ++t) {
+            workers[t].init(t, P, DS, DL, cats.num_campaigns + 1u, num_days);
+        }
+
+        // Phase 1: Parse events & clicks (single scatter directly to person partitions!)
+        parse_events_and_clicks(pool);
+        prof.mark("parse+scatter");
+
+        // Phase 2: L2-resident exact dedup (kills ~3% losing copies in place!)
+        dedup_phase(pool);
+        prof.mark("dedup");
+
+        // Phase 3: Sort-free 30-min sessionization + O(S+C) attribution/assists + parallel user_daily Parquet!
+        sessions_and_write(pool);
+        prof.mark("sessions+user_pq");
+
+        // Phase 4: Merge campaign_daily & write Parquet
+        write_campaign_daily();
+        prof.mark("campaign_pq");
+
+        // Fast clean exit: skip C++ destructors & single-threaded munmap storms!
+        // Optional parallel MADV_DONTNEED to offload kernel PTE teardown across cores.
+        if (eff_ncpu > 1 && total_ev_bytes > (256u << 20)) {
+            u32 nreg = std::min<u32>(g_regions.count.load(std::memory_order_relaxed), 4096u);
+            std::atomic<u32> ri{0};
+            pool.run([&](int) {
+                for (;;) {
+                    u32 i = ri.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= nreg) break;
+                    ::madvise(g_regions.regs[i].ptr, g_regions.regs[i].len, MADV_DONTNEED);
+                }
+            });
+            prof.mark("madv_release");
+        }
+
+        pool.detach_all();
+        _exit(0);
+    }
+};
+
+} // namespace hyp
+
+int main(int argc, char** argv) {
+    static hyp::Pipeline pipe;
+    pipe.run(argc, argv);
+    return 0;
+}

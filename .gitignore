@@ -1,0 +1,10 @@
+.local/
+build/
+out/
+dev/
+dev-answer/
+*.parquet
+*.o
+*.gcda
+*.profdata
+__pycache__/
