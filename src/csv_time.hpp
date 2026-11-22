@@ -339,18 +339,20 @@ static inline void scan_csv(const u8* base, size_t start, size_t end, Callback&&
         StreamScanner sc;
         sc.init(base, start, fast_end);
         size_t ls = start;
+        u64 q0 = sc.qbefore(ls);
         while (ls < fast_end) {
-            const u64 q0 = sc.qbefore(ls);
             size_t fs = ls;
             u32 expq = 0;
             u32 bad = 0;
             bool ok = true;
+            #pragma GCC unroll 8
             for (int i = 0; i < NF; ++i) {
                 size_t p = sc.next();
                 u8 c = base[p];
                 if (i < NF - 1) {
                     if (__builtin_expect(c == '\n', 0)) {
                         ls = p + 1;
+                        q0 = sc.qbefore(ls);
                         ok = false;
                         break;
                     }
@@ -358,12 +360,13 @@ static inline void scan_csv(const u8* base, size_t start, size_t end, Callback&&
                     if (__builtin_expect(c != '\n', 0)) {
                         do { p = sc.next(); } while (p < fast_end && base[p] != '\n');
                         ls = p + 1;
+                        q0 = sc.qbefore(ls);
                         ok = false;
                         break;
                     }
                 }
                 u32 len = u32(p - fs);
-                u32 isq = (len > 0 && base[fs] == '"') ? 1u : 0u;
+                u32 isq = (base[fs] == '"') ? 1u : 0u;
                 bad |= isq & ((len < 2u) | (base[p - 1] != '"'));
                 fl[i].p = base + fs + isq;
                 fl[i].n = len - 2u * isq;
@@ -372,8 +375,10 @@ static inline void scan_csv(const u8* base, size_t start, size_t end, Callback&&
             }
             if (__builtin_expect(ok, 1)) {
                 ls = fs;
-                // Check exact quote count across the line: equals 2 * (# quoted fields) iff zero bad quotes!
-                if (__builtin_expect(bad == 0 && (sc.qbefore(fs - 1) - q0) == u64(expq), 1)) {
+                u64 q1 = sc.qbefore(fs - 1);
+                u64 dq = q1 - q0;
+                q0 = q1;
+                if (__builtin_expect(bad == 0 && dq == u64(expq), 1)) {
                     cb(fl);
                 }
             }

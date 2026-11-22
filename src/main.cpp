@@ -457,15 +457,15 @@ struct Pipeline {
     struct PendEvent {
         u64 eid_lo;
         u64 eid_hi;
-        u8  eid_dom;
-        u8  is_purch;
-        u16 cat;
-        u32 ing_sec;
-        i64 ing_ms;
-        UserKey raw_user;
+        u64 u_lo;
+        u64 u_hi;
         u64 uhash;
         u32 ts_rel;
-        u32 price;
+        u32 ing_sec;
+        u32 price;   // 0 if not purchase
+        u16 cat;
+        u8  eid_dom;
+        u8  u_dom;
     };
 
     struct PendClick {
@@ -484,11 +484,11 @@ struct Pipeline {
 
         if (check_links) {
             for (int i = 0; i < n; ++i) {
-                if (buf[i].raw_user.dom != DOM_EXOTIC) links.prefetch_bloom(buf[i].uhash);
+                if (buf[i].u_dom != DOM_EXOTIC) links.prefetch_bloom(buf[i].uhash);
             }
             for (int i = 0; i < n; ++i) {
-                u8 d = buf[i].raw_user.dom;
-                if (d == DOM_SHORT) {
+                u8 d = buf[i].u_dom;
+                if (__builtin_expect(d == DOM_SHORT, 1)) {
                     bool h = links.bloom_may_contain(buf[i].uhash);
                     hit[i] = h ? 1 : 0;
                     if (h) links.prefetch_short_alias(buf[i].uhash);
@@ -508,9 +508,9 @@ struct Pipeline {
 
         for (int i = 0; i < n; ++i) {
             const PendEvent& pe = buf[i];
-            UserKey canon = pe.raw_user;
+            UserKey canon{pe.u_lo, pe.u_hi, pe.u_dom};
             if (check_links && hit[i]) {
-                if (canon.dom == DOM_SHORT) {
+                if (__builtin_expect(canon.dom == DOM_SHORT, 1)) {
                     canon = links.resolve_short_hit(canon.lo, pe.uhash);
                 } else if (canon.dom == DOM_HEX32) {
                     canon = links.resolve_hex_hit(canon.hi, canon.lo, pe.uhash);
@@ -520,7 +520,7 @@ struct Pipeline {
                 }
             }
 
-            u64 ch = (canon.dom == pe.raw_user.dom && canon.lo == pe.raw_user.lo && canon.hi == pe.raw_user.hi)
+            u64 ch = (canon.dom == pe.u_dom && canon.lo == pe.u_lo && canon.hi == pe.u_hi)
                      ? pe.uhash : hash_user_key(canon);
             u32 p = u32(ch >> 32) & pmask;
 
@@ -533,18 +533,16 @@ struct Pipeline {
                 loc = w.emit_exotic_p(p, u32(canon.lo), pe.ts_rel);
             }
 
-            if (__builtin_expect(pe.is_purch, 0)) {
+            if (__builtin_expect(pe.price != 0, 0)) {
                 w.emit_purch(p, {canon.lo, canon.hi, pe.ts_rel, pe.price, loc, pe.cat, canon.dom, 0});
             }
 
             if (__builtin_expect(pe.eid_dom == DOM_SHORT, 1)) {
                 u32 q = u32(wyhash64(pe.eid_lo) >> 32) & dsmask;
                 w.emit_short_e(q, {pe.eid_lo, pe.ing_sec, loc});
-            } else if (pe.eid_dom == DOM_HEX32) {
+            } else {
                 u32 q = u32(wyhash128(pe.eid_hi, pe.eid_lo) >> 32) & dlmask;
                 w.emit_long_e(q, {pe.eid_hi, pe.eid_lo, pe.ing_sec, loc});
-            } else {
-                w.exotic_erecs.push_back({u32(pe.eid_lo), loc, pe.ing_ms});
             }
         }
     }
@@ -596,27 +594,73 @@ struct Pipeline {
         }
     }
 
+    bool use_pread_events = false;
+
+    static inline size_t pread_all(int fd, u8* dst, size_t len, size_t off) {
+        size_t got_tot = 0;
+        while (got_tot < len) {
+            ssize_t r = ::pread(fd, dst + got_tot, len - got_tot, off_t(off + got_tot));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                die("pread failed");
+            }
+            if (r == 0) break;
+            got_tot += size_t(r);
+        }
+        return got_tot;
+    }
+
     void parse_events_and_clicks(ThreadPool& pool) {
         struct Task { u8 kind; u32 file; size_t s, e; };
         std::vector<Task> tasks;
-        tasks.reserve(2048);
+        tasks.reserve(4096);
 
-        auto add_tasks = [&](u8 kind, const std::vector<MFile>& files) {
-            constexpr size_t CSZ = 2u << 20;
-            for (u32 fi = 0; fi < files.size(); ++fi) {
-                const MFile& mf = files[fi];
+        const size_t EV_CSZ = use_pread_events ? (512u << 10) : (2u << 20);
+        for (u32 fi = 0; fi < event_files.size(); ++fi) {
+            const MFile& mf = event_files[fi];
+            if (mf.size == 0) continue;
+            size_t body = 0;
+            if (use_pread_events) {
+                u8 hbuf[512];
+                size_t hn = pread_all(mf.fd, hbuf, std::min<size_t>(mf.size, sizeof(hbuf)), 0);
+                const u8* nl = static_cast<const u8*>(std::memchr(hbuf, '\n', hn));
+                if (!nl) {
+                    // Header longer than 512B (rare): scan forward
+                    size_t off = hn;
+                    while (off < mf.size && !nl) {
+                        hn = pread_all(mf.fd, hbuf, std::min<size_t>(mf.size - off, sizeof(hbuf)), off);
+                        nl = static_cast<const u8*>(std::memchr(hbuf, '\n', hn));
+                        if (nl) { body = off + size_t(nl - hbuf) + 1; break; }
+                        off += hn;
+                    }
+                    if (!nl) continue;
+                } else {
+                    body = size_t(nl - hbuf) + 1;
+                }
+            } else {
+                const u8* nl = static_cast<const u8*>(std::memchr(mf.data, '\n', mf.size));
+                if (!nl) continue;
+                body = size_t(nl - mf.data) + 1;
+            }
+            if (body >= mf.size) continue;
+            for (size_t off = body; off < mf.size; off += EV_CSZ) {
+                tasks.push_back({0, fi, off, std::min(off + EV_CSZ, mf.size)});
+            }
+        }
+        {
+            constexpr size_t CK_CSZ = 2u << 20;
+            for (u32 fi = 0; fi < click_files.size(); ++fi) {
+                const MFile& mf = click_files[fi];
                 if (mf.size == 0) continue;
                 const u8* nl = static_cast<const u8*>(std::memchr(mf.data, '\n', mf.size));
                 if (!nl) continue;
                 size_t body = size_t(nl - mf.data) + 1;
                 if (body >= mf.size) continue;
-                for (size_t off = body; off < mf.size; off += CSZ) {
-                    tasks.push_back({kind, fi, off, std::min(off + CSZ, mf.size)});
+                for (size_t off = body; off < mf.size; off += CK_CSZ) {
+                    tasks.push_back({1, fi, off, std::min(off + CK_CSZ, mf.size)});
                 }
             }
-        };
-        add_tasks(0, event_files);
-        add_tasks(1, click_files);
+        }
 
         std::atomic<size_t> next_task{0};
         pool.run([&](int tid) {
@@ -625,129 +669,199 @@ struct Pipeline {
             PendClick ck_buf[64];
             int nev = 0, nck = 0;
 
+            // Reusable 64-byte aligned pread buffer (512 KiB + 8 KiB tail overlap + 128 B zero guard)
+            constexpr size_t OVERLAP = 8192;
+            alignas(64) u8* rbuf = nullptr;
+            if (use_pread_events) {
+                rbuf = static_cast<u8*>(::aligned_alloc(64, EV_CSZ + OVERLAP + 128));
+            }
+
+            auto handle_event_line = [&](const Field fl[7]) {
+                if (__builtin_expect(fl[0].n == 0, 0)) return;
+
+                i64 ing_sec_abs = ftime.parse_ingest_sec(fl[3].p, fl[3].n);
+                i64 ing_ms;
+                bool ing_compact;
+                i64 ing_diff = 0;
+                if (__builtin_expect(ing_sec_abs != INVALID_TS, 1)) {
+                    ing_ms = ing_sec_abs * 1000LL;
+                    ing_diff = ing_sec_abs - ing_origin_sec;
+                    ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL);
+                } else {
+                    ing_ms = parse_ts_general(fl[3].p, fl[3].n);
+                    if (ing_ms == INVALID_TS) return;
+                    ing_diff = (ing_ms / 1000LL) - ing_origin_sec;
+                    ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL && (ing_ms % 1000LL) == 0);
+                }
+
+                bool valid = (fl[1].n > 0 && fl[5].n > 0);
+                i64 ts = INVALID_TS;
+                if (__builtin_expect(valid, 1)) {
+                    ts = ftime.parse(fl[2].p, fl[2].n);
+                    valid = (ts >= window_start && ts < window_end && (ing_ms - ts) <= DAY_MS);
+                }
+
+                u64 eid_lo = 0, eid_hi = 0;
+                u8 eid_dom = DOM_EXOTIC;
+                if (__builtin_expect(ing_compact, 1)) {
+                    u64 sw;
+                    if (try_pack_short<'e'>(fl[0].p, fl[0].n, sw)) {
+                        eid_lo = sw;
+                        eid_dom = DOM_SHORT;
+                    } else {
+                        Hex128 hx;
+                        if (try_pack_hex32<'e'>(fl[0].p, fl[0].n, hx)) {
+                            eid_hi = hx.hi;
+                            eid_lo = hx.lo;
+                            eid_dom = DOM_HEX32;
+                        }
+                    }
+                }
+                if (__builtin_expect(eid_dom == DOM_EXOTIC, 0)) {
+                    eid_lo = event_exotic.intern(fl[0].p, fl[0].n);
+                }
+
+                u32 price = 0;
+                u16 cat = 0;
+                if (__builtin_expect(valid, 1)) {
+                    const u8* tp = fl[4].p;
+                    u32 tn = fl[4].n;
+                    if (tn == 4) {
+                        u32 w4;
+                        std::memcpy(&w4, tp, 4);
+                        valid = (w4 == 0x77656976u /*"view"*/) || (w4 == 0x74726163u /*"cart"*/);
+                    } else if (tn == 8) {
+                        u64 w8;
+                        std::memcpy(&w8, tp, 8);
+                        if (w8 == 0x6573616863727570ULL /*"purchase"*/) {
+                            valid = parse_price_cents(fl[6].p, fl[6].n, price);
+                            if (valid) cat = cats.lookup_product(fl[5].p, fl[5].n);
+                        } else {
+                            valid = false;
+                        }
+                    } else {
+                        valid = false;
+                    }
+                }
+
+                if (__builtin_expect(!valid, 0)) {
+                    if (eid_dom == DOM_SHORT) {
+                        u32 q = u32(wyhash64(eid_lo) >> 32) & (DS - 1u);
+                        w.emit_short_e(q, {eid_lo, u32(ing_diff), INVALID_LOC});
+                    } else if (eid_dom == DOM_HEX32) {
+                        u32 q = u32(wyhash128(eid_hi, eid_lo) >> 32) & (DL - 1u);
+                        w.emit_long_e(q, {eid_hi, eid_lo, u32(ing_diff), INVALID_LOC});
+                    } else {
+                        w.exotic_erecs.push_back({u32(eid_lo), INVALID_LOC, ing_ms});
+                    }
+                    return;
+                }
+
+                UserKey uk = encode_user_key(fl[1].p, fl[1].n, user_exotic);
+                if (__builtin_expect(eid_dom == DOM_EXOTIC, 0)) {
+                    // Rare exotic event_id: emit immediately so PendEvent stays compact!
+                    UserKey canon = uk;
+                    if (links.has_aliases) {
+                        u64 uh = hash_user_key(uk);
+                        if (canon.dom == DOM_SHORT) {
+                            if (links.bloom_may_contain(uh)) canon = links.resolve_short_hit(canon.lo, uh);
+                        } else if (canon.dom == DOM_HEX32) {
+                            if (links.bloom_may_contain(uh)) canon = links.resolve_hex_hit(canon.hi, canon.lo, uh);
+                        } else {
+                            auto it = links.exotic_aliases.find(u32(canon.lo));
+                            if (it != links.exotic_aliases.end()) canon = it->second;
+                        }
+                    }
+                    u32 p = u32(hash_user_key(canon) >> 32) & (P - 1u);
+                    u32 ts_rel = u32(ts - window_start);
+                    u32 loc = (canon.dom == DOM_SHORT) ? w.emit_short_p(p, canon.lo, ts_rel)
+                            : (canon.dom == DOM_HEX32) ? w.emit_long_p(p, canon.hi, canon.lo, ts_rel)
+                            : w.emit_exotic_p(p, u32(canon.lo), ts_rel);
+                    if (price != 0) w.emit_purch(p, {canon.lo, canon.hi, ts_rel, price, loc, cat, canon.dom, 0});
+                    w.exotic_erecs.push_back({u32(eid_lo), loc, ing_ms});
+                    return;
+                }
+
+                PendEvent& pe = ev_buf[nev++];
+                pe.eid_lo = eid_lo;
+                pe.eid_hi = eid_hi;
+                pe.u_lo = uk.lo;
+                pe.u_hi = uk.hi;
+                pe.uhash = hash_user_key(uk);
+                pe.ts_rel = u32(ts - window_start);
+                pe.ing_sec = u32(ing_diff);
+                pe.price = price;
+                pe.cat = cat;
+                pe.eid_dom = eid_dom;
+                pe.u_dom = uk.dom;
+                if (nev == 64) {
+                    flush_events(w, ev_buf, nev);
+                    nev = 0;
+                }
+            };
+
             for (;;) {
                 size_t ti = next_task.fetch_add(1, std::memory_order_relaxed);
                 if (ti >= tasks.size()) break;
                 const Task& tk = tasks[ti];
-                const MFile& mf = (tk.kind == 0) ? event_files[tk.file] : click_files[tk.file];
-
-                size_t s = tk.s;
-                if (s > 0 && mf.data[s - 1] != '\n') {
-                    const u8* nl = static_cast<const u8*>(std::memchr(mf.data + s, '\n', mf.size - s));
-                    if (!nl) continue;
-                    s = size_t(nl - mf.data) + 1;
-                }
-                if (s >= tk.e) continue;
-                size_t e = tk.e;
-                if (e < mf.size && mf.data[e - 1] != '\n') {
-                    const u8* nl = static_cast<const u8*>(std::memchr(mf.data + e, '\n', mf.size - e));
-                    e = nl ? size_t(nl - mf.data) + 1 : mf.size;
-                }
 
                 if (tk.kind == 0) {
-                    scan_csv<7>(mf.data, s, e, [&](const Field fl[7]) {
-                        if (__builtin_expect(fl[0].n == 0, 0)) return;
+                    const MFile& mf = event_files[tk.file];
+                    if (use_pread_events) {
+                        // Read [tk.s - 1 (if s>0), min(mf.size, tk.e + OVERLAP)) into 64B-aligned rbuf!
+                        size_t r_off = (tk.s > 0) ? (tk.s - 1) : 0;
+                        size_t r_end = std::min(mf.size, tk.e + OVERLAP);
+                        size_t r_len = pread_all(mf.fd, rbuf, r_end - r_off, r_off);
+                        std::memset(rbuf + r_len, 0, 128); // guard bytes for 64B SIMD loads!
 
-                        // Ultra-fast SWAR F1 ingest_ts parser (zero hash, zero date loop!)
-                        i64 ing_sec_abs = ftime.parse_ingest_sec(fl[3].p, fl[3].n);
-                        i64 ing_ms;
-                        bool ing_compact;
-                        i64 ing_diff = 0;
-                        if (__builtin_expect(ing_sec_abs != INVALID_TS, 1)) {
-                            ing_ms = ing_sec_abs * 1000LL;
-                            ing_diff = ing_sec_abs - ing_origin_sec;
-                            ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL);
-                        } else {
-                            ing_ms = parse_ts_general(fl[3].p, fl[3].n);
-                            if (ing_ms == INVALID_TS) return;
-                            ing_diff = (ing_ms / 1000LL) - ing_origin_sec;
-                            ing_compact = (ing_diff >= 0 && ing_diff < 0xFFFFFFFELL && (ing_ms % 1000LL) == 0);
+                        size_t s = (tk.s > 0) ? 1u : 0u;
+                        if (tk.s > 0 && rbuf[0] != '\n') {
+                            const u8* nl = static_cast<const u8*>(std::memchr(rbuf + 1, '\n', r_len - 1));
+                            if (!nl) continue;
+                            s = size_t(nl - rbuf) + 1;
                         }
-
-                        bool valid = (fl[1].n > 0 && fl[5].n > 0);
-                        i64 ts = INVALID_TS;
-                        if (__builtin_expect(valid, 1)) {
-                            ts = ftime.parse(fl[2].p, fl[2].n);
-                            valid = (ts >= window_start && ts < window_end && (ing_ms - ts) <= DAY_MS);
-                        }
-
-                        u64 eid_lo = 0, eid_hi = 0;
-                        u8 eid_dom = DOM_EXOTIC;
-                        if (__builtin_expect(ing_compact, 1)) {
-                            u64 sw;
-                            if (try_pack_short<'e'>(fl[0].p, fl[0].n, sw)) {
-                                eid_lo = sw;
-                                eid_dom = DOM_SHORT;
+                        size_t target_e = tk.e - r_off;
+                        if (s >= target_e) continue;
+                        size_t e = target_e;
+                        if (tk.e < mf.size && rbuf[e - 1] != '\n') {
+                            const u8* nl = static_cast<const u8*>(std::memchr(rbuf + e, '\n', r_len - e));
+                            if (nl) {
+                                e = size_t(nl - rbuf) + 1;
                             } else {
-                                Hex128 hx;
-                                if (try_pack_hex32<'e'>(fl[0].p, fl[0].n, hx)) {
-                                    eid_hi = hx.hi;
-                                    eid_lo = hx.lo;
-                                    eid_dom = DOM_HEX32;
-                                }
+                                // Line exceeded OVERLAP (extremely rare): fallback read full line
+                                e = r_len;
                             }
                         }
-                        if (__builtin_expect(eid_dom == DOM_EXOTIC, 0)) {
-                            eid_lo = event_exotic.intern(fl[0].p, fl[0].n);
+                        scan_csv<7>(rbuf, s, e, handle_event_line);
+                    } else {
+                        size_t s = tk.s;
+                        if (s > 0 && mf.data[s - 1] != '\n') {
+                            const u8* nl = static_cast<const u8*>(std::memchr(mf.data + s, '\n', mf.size - s));
+                            if (!nl) continue;
+                            s = size_t(nl - mf.data) + 1;
                         }
-
-                        u8 is_purch = 0;
-                        u32 price = 0;
-                        u16 cat = 0;
-                        if (__builtin_expect(valid, 1)) {
-                            const u8* tp = fl[4].p;
-                            u32 tn = fl[4].n;
-                            if (tn == 4) {
-                                u32 w4;
-                                std::memcpy(&w4, tp, 4);
-                                valid = (w4 == 0x77656976u /*"view"*/) || (w4 == 0x74726163u /*"cart"*/);
-                            } else if (tn == 8) {
-                                u64 w8;
-                                std::memcpy(&w8, tp, 8);
-                                if (w8 == 0x6573616863727570ULL /*"purchase"*/) {
-                                    is_purch = 1;
-                                    valid = parse_price_cents(fl[6].p, fl[6].n, price);
-                                    if (valid) cat = cats.lookup_product(fl[5].p, fl[5].n);
-                                } else {
-                                    valid = false;
-                                }
-                            } else {
-                                valid = false;
-                            }
+                        if (s >= tk.e) continue;
+                        size_t e = tk.e;
+                        if (e < mf.size && mf.data[e - 1] != '\n') {
+                            const u8* nl = static_cast<const u8*>(std::memchr(mf.data + e, '\n', mf.size - e));
+                            e = nl ? size_t(nl - mf.data) + 1 : mf.size;
                         }
-
-                        if (__builtin_expect(!valid, 0)) {
-                            if (eid_dom == DOM_SHORT) {
-                                u32 q = u32(wyhash64(eid_lo) >> 32) & (DS - 1u);
-                                w.emit_short_e(q, {eid_lo, u32(ing_diff), INVALID_LOC});
-                            } else if (eid_dom == DOM_HEX32) {
-                                u32 q = u32(wyhash128(eid_hi, eid_lo) >> 32) & (DL - 1u);
-                                w.emit_long_e(q, {eid_hi, eid_lo, u32(ing_diff), INVALID_LOC});
-                            } else {
-                                w.exotic_erecs.push_back({u32(eid_lo), INVALID_LOC, ing_ms});
-                            }
-                            return;
-                        }
-
-                        UserKey uk = encode_user_key(fl[1].p, fl[1].n, user_exotic);
-                        PendEvent& pe = ev_buf[nev++];
-                        pe.eid_lo = eid_lo;
-                        pe.eid_hi = eid_hi;
-                        pe.eid_dom = eid_dom;
-                        pe.is_purch = is_purch;
-                        pe.cat = cat;
-                        pe.ing_sec = u32(ing_diff);
-                        pe.ing_ms = ing_ms;
-                        pe.raw_user = uk;
-                        pe.uhash = hash_user_key(uk);
-                        pe.ts_rel = u32(ts - window_start);
-                        pe.price = price;
-                        if (nev == 64) {
-                            flush_events(w, ev_buf, nev);
-                            nev = 0;
-                        }
-                    });
+                        scan_csv<7>(mf.data, s, e, handle_event_line);
+                    }
                 } else {
+                    const MFile& mf = click_files[tk.file];
+                    size_t s = tk.s;
+                    if (s > 0 && mf.data[s - 1] != '\n') {
+                        const u8* nl = static_cast<const u8*>(std::memchr(mf.data + s, '\n', mf.size - s));
+                        if (!nl) continue;
+                        s = size_t(nl - mf.data) + 1;
+                    }
+                    if (s >= tk.e) continue;
+                    size_t e = tk.e;
+                    if (e < mf.size && mf.data[e - 1] != '\n') {
+                        const u8* nl = static_cast<const u8*>(std::memchr(mf.data + e, '\n', mf.size - e));
+                        e = nl ? size_t(nl - mf.data) + 1 : mf.size;
+                    }
                     const u32 fshift = tk.file << 20;
                     scan_csv<4>(mf.data, s, e, [&](const Field fl[4]) {
                         if (__builtin_expect(fl[0].n == 0 || fl[1].n == 0, 0)) return;
@@ -774,6 +888,7 @@ struct Pipeline {
             flush_events(w, ev_buf, nev);
             flush_clicks(w, ck_buf, nck);
             w.flush_all_stages();
+            if (rbuf) std::free(rbuf);
         });
     }
 
@@ -1541,6 +1656,9 @@ struct Pipeline {
         auto epaths = list_csv_files(data_dir + "/events");
         auto cpaths = list_csv_files(data_dir + "/clicks");
 
+        const char* env_io = std::getenv("HYPERION_IO");
+        use_pread_events = (env_io && std::strcmp(env_io, "pread") == 0);
+
         size_t total_ev_bytes = 0;
         link_files.resize(lpaths.size());
         for (size_t i = 0; i < lpaths.size(); ++i) {
@@ -1549,9 +1667,13 @@ struct Pipeline {
         }
         event_files.resize(epaths.size());
         for (size_t i = 0; i < epaths.size(); ++i) {
-            if (!event_files[i].open_map(epaths[i])) die("open event file");
+            if (use_pread_events) {
+                if (!event_files[i].open_fd(epaths[i])) die("open event file");
+            } else {
+                if (!event_files[i].open_map(epaths[i])) die("open event file");
+                event_files[i].close_fd();
+            }
             total_ev_bytes += event_files[i].size;
-            event_files[i].close_fd();
         }
         click_files.resize(cpaths.size());
         for (size_t i = 0; i < cpaths.size(); ++i) {
@@ -1559,18 +1681,18 @@ struct Pipeline {
             click_files[i].close_fd();
         }
 
-        // L1/L2 cache-tuned partition counts
+        // L1/L2 cache-tuned partition counts (overridable via env for A/B sweeps)
         if (total_ev_bytes < (16u << 20)) {
             P = 64; DS = 64; DL = 32;
         } else if (total_ev_bytes < (256u << 20)) {
             P = 256; DS = 256; DL = 64;
         } else if (total_ev_bytes < (3000ULL << 20)) {
-            // ~20M practice (~1.7 GB CSV): P=512 (32KB L1 stage), DS=1024 (64KB L2 stage)
             P = 512; DS = 1024; DL = 256;
         } else {
-            // ~60M final (~5.5 GB CSV): P=1024 (64KB stage), DS=2048 (128KB stage)
             P = 1024; DS = 2048; DL = 512;
         }
+        if (const char* ep = std::getenv("HYPERION_P"))  { u32 v = u32(std::atoi(ep)); if (v >= 16 && (v & (v - 1)) == 0) P = v; }
+        if (const char* ed = std::getenv("HYPERION_DS")) { u32 v = u32(std::atoi(ed)); if (v >= 16 && (v & (v - 1)) == 0) DS = v; }
 
         int eff_ncpu = (total_ev_bytes < (256u << 10)) ? 1 : ncpu;
         ThreadPool pool(eff_ncpu);

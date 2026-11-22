@@ -225,6 +225,17 @@ struct MFile {
         return true;
     }
 
+    bool open_fd(const std::string& path) {
+        fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        struct stat st;
+        if (::fstat(fd, &st) != 0) { ::close(fd); fd = -1; return false; }
+        size = size_t(st.st_size);
+        data = nullptr;
+        mapped = 0;
+        return true;
+    }
+
     void close_fd() {
         if (fd >= 0) { ::close(fd); fd = -1; }
     }
